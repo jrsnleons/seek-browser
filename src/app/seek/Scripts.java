@@ -106,5 +106,14 @@ final class Scripts {
         + "img,video,picture,canvas,iframe,embed,object,[style*=\"background-image\"]{filter:invert(1) hue-rotate(180deg)!important}';"
         + "document.documentElement.appendChild(s);})();";
 
+    /** Lite mode: video plays only after a tap. */
+    static final String LITE =
+        "(function(){if(window.__seekLite)return;window.__seekLite=1;var tap=0;"
+        + "['pointerdown','touchstart','keydown','click'].forEach(function(e){addEventListener(e,function(){tap=Date.now()},true)});"
+        + "document.addEventListener('play',function(e){var v=e.target;if(v&&v.tagName==='VIDEO'&&Date.now()-tap>1500){v.pause();v.removeAttribute('autoplay');v.preload='none';}},true);"
+        + "[].forEach.call(document.querySelectorAll('video[autoplay]'),function(v){v.pause();v.removeAttribute('autoplay');});})();";
+
+    static final String THEME = "(function(){var m=document.querySelector('meta[name=theme-color]');return m?m.content:''})();";
+
     private Scripts() {}
 }

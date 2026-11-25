@@ -189,6 +189,41 @@ final class Store {
         write("hidden.json", hidden.toString());
     }
 
+    /** Your bookmarks first, then the sites you visit most, for the new tab's tiles. */
+    List<Entry> topSites(int max) {
+        List<Entry> out = new ArrayList<>();
+        Set<String> hosts = new HashSet<>();
+        for (Entry e : bookmarks) {
+            if (out.size() >= max) return out;
+            String h = Tab.hostOf(e.url);
+            if (h == null || hosts.contains(h)) continue;
+            hosts.add(h); out.add(e);
+        }
+        final java.util.Map<String, Integer> count = new java.util.HashMap<>();
+        java.util.Map<String, Entry> first = new java.util.HashMap<>();
+        for (Entry e : history) {
+            String h = Tab.hostOf(e.url);
+            if (h == null) continue;
+            Integer c = count.get(h);
+            count.put(h, c == null ? 1 : c + 1);
+            if (!first.containsKey(h)) first.put(h, e);
+        }
+        List<String> order = new ArrayList<>(count.keySet());
+        java.util.Collections.sort(order, new java.util.Comparator<String>() {
+            public int compare(String a, String b) { return count.get(b) - count.get(a); }
+        });
+        for (String h : order) {
+            if (out.size() >= max) break;
+            if (hosts.contains(h) || count.get(h) < 2) continue;
+            Entry e = first.get(h);
+            String scheme = e.url.startsWith("http://") ? "http://" : "https://";
+            String name = h.startsWith("www.") ? h.substring(4) : h;
+            out.add(new Entry(scheme + h + "/", name, e.time));
+            hosts.add(h);
+        }
+        return out;
+    }
+
     void clearHidden() {
         hidden = new JSONObject();
         write("hidden.json", "{}");

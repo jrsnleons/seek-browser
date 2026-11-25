@@ -55,19 +55,53 @@ public class MainTest {
         assertEquals(2, m.tabs.size());
         m.switcher(false); idle(); m.dismissOverlay();
 
-        // split view
+        // split view, up to three
         m.split(a); idle();
-        assertSame(a, m.right); assertSame(b, m.left);
-        assertEquals(View.VISIBLE, m.paneB.getVisibility());
+        assertEquals(2, m.shown.size());
+        assertSame(b, m.shown.get(0)); assertSame(a, m.shown.get(1));
+        assertEquals(View.VISIBLE, m.panes[1].getVisibility());
         m.focusPane(a); assertSame(a, m.current);
         m.switcher(true); idle(); m.dismissOverlay();
+        Tab c = m.newTab(null, false); c.url = "https://c.example/"; c.host = "c.example";
+        m.onTabDropped(c, 2, 100); idle();
+        assertNotNull(m.menu);
+        java.util.List<String> drop = new java.util.ArrayList<>();
+        clickAllText(m.menu.getContentView(), drop);
+        System.out.println("DROP: " + drop);
+        assertTrue(drop.contains("Split screen into three"));
+        m.menu.dismiss();
+        m.preview(c, 2); m.hint(null, 0, 0, 0, 0);
+        assertTrue(m.addPane(c, 0)); idle();
+        assertEquals(3, m.shown.size());
+        assertSame(c, m.shown.get(0));
+        assertSame(m.panes[0], c.view.getParent());
+        assertSame(m.panes[2], a.view.getParent());
+        assertEquals(View.VISIBLE, m.dividers[1].getVisibility());
+        m.pageMenu(m.root); m.menu.dismiss();
+        m.replacePane(1, a); idle();         // a was in front already: the two swap
+        assertSame(a, m.shown.get(1)); assertSame(b, m.shown.get(2));
+        assertSame(m.panes[1], a.view.getParent());
+        m.removePane(c); idle();
+        assertEquals(2, m.shown.size());
+        assertNull(c.view.getParent());
+        m.saveSession();
+        assertTrue(m.store.session().toString().contains("\"shown\":[0,2]") || m.store.session().optJSONArray("shown").length() == 2);
         m.endSplit(); idle();
-        assertNull(m.right); assertSame(a, m.current);
-        assertSame(a.view.getParent(), m.paneA);
+        assertEquals(1, m.shown.size()); assertSame(a, m.current);
+        assertSame(m.paneA, a.view.getParent());
+        assertEquals(View.GONE, m.panes[1].getVisibility());
         m.split(b); idle();
         m.close(b); idle();
-        assertNull(m.right);
+        assertEquals(1, m.shown.size());
+        m.close(c); idle();
         assertEquals(1, m.tabs.size());
+
+        // small pieces
+        assertEquals(0xFFFF0000, Main.parseColor("#f00"));
+        assertEquals(0xFF102030, Main.parseColor("rgb(16, 32, 48)"));
+        assertEquals(0, Main.parseColor(""));
+        assertTrue(Main.isFont("https://fonts.gstatic.com/s/x.woff2?v=1"));
+        assertFalse(Main.isFont("https://a.example/app.js"));
 
         // private tab
         m.newPrivateTab(); idle(); m.dismissOverlay();
@@ -121,7 +155,9 @@ public class MainTest {
 
     @Test public void topAndBlack() {
         android.content.SharedPreferences p = org.robolectric.RuntimeEnvironment.getApplication().getSharedPreferences("seek", 0);
-        p.edit().putBoolean("top", true).putBoolean("black", true).putInt("look", 2).putInt("wall", 3).commit();
+        p.edit().putBoolean("top", true).putBoolean("black", true).putInt("look", 2).putInt("wall", 3)
+            .putBoolean("inter", true).putBoolean("compact", true).putBoolean("autohide", true).putBoolean("tint", true)
+            .putBoolean("lite", true).putBoolean("motion", false).commit();
         Main m = launch(new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/")));
         assertTrue(m.top);
         assertTrue(Ui.black);
@@ -135,7 +171,10 @@ public class MainTest {
         m.saveSession();
         // the split comes back next launch
         Main again = launch(new Intent());
-        assertNotNull(again.right);
+        assertEquals(2, again.shown.size());
+        assertTrue(again.lite);
+        again.topBar(true); assertEquals(View.GONE, again.column.getVisibility());
+        again.topBar(false); assertEquals(View.VISIBLE, again.column.getVisibility());
         System.out.println("restored tabs: " + again.tabs.size());
     }
 
@@ -144,6 +183,10 @@ public class MainTest {
         assertEquals(1, m.tabs.size());
         assertNull(m.current.url);
         assertNotNull(m.overlay);   // the field opens straight away
+        assertEquals(View.VISIBLE, m.home.getVisibility());
+        m.store.visit("https://often.example/a", "A"); m.store.visit("https://often.example/b", "B");
+        m.showHome();
+        assertEquals(1, m.tiles.getChildCount());
         m.onBackPressed();
         assertNull(m.overlay);
     }

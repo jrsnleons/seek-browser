@@ -19,6 +19,9 @@ final class Tab {
     boolean readerAsked;
     int progress = 100;
     volatile String host;
+    boolean curtained;
+    /** The site's theme colour, for tinting the frame; 0 for none. */
+    int tint;
 
     Tab(String url, String title, boolean pinned) {
         this.url = url;

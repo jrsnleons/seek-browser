@@ -35,6 +35,13 @@ final class Ui {
     static int scrim()    { return black ? 0x99000000 : dark ? 0x66000000 : 0x22000000; }
 
     static float density = 2f;
+    /** Inter, when chosen in Settings; otherwise the tablet's own sans. */
+    static Typeface font, fontMedium;
+    static boolean compact;
+    static boolean motion = true;
+
+    static float rowDp() { return compact ? 30 : 36; }
+    static float textSp() { return compact ? 13 : 14; }
 
     static int dp(float v) { return Math.round(v * density); }
 
@@ -67,10 +74,11 @@ final class Ui {
         t.setEllipsize(android.text.TextUtils.TruncateAt.END);
         t.setIncludeFontPadding(false);
         t.setGravity(Gravity.CENTER_VERTICAL);
+        if (font != null) t.setTypeface(font);
         return t;
     }
 
-    static Typeface medium() { return Typeface.create("sans-serif-medium", Typeface.NORMAL); }
+    static Typeface medium() { return fontMedium != null ? fontMedium : Typeface.create("sans-serif-medium", Typeface.NORMAL); }
 
     /** Drawn icons, a stroke each, so they look the same whatever fonts the tablet has. */
     static final class Icon extends View {
