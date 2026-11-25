@@ -9,7 +9,7 @@ JAR=$HOME/android/all.jar
 rm -rf out && mkdir -p out/res out/gen out/classes
 aapt2 compile --dir res -o out/res/res.zip
 aapt2 link -I "$JAR" --manifest AndroidManifest.xml --min-sdk-version 23 --target-sdk-version 34 \
-  --version-code 3 --version-name 1.2 --java out/gen -o out/base.apk out/res/res.zip --auto-add-overlay -A assets
+  --version-code 4 --version-name 1.3 --java out/gen -o out/base.apk out/res/res.zip --auto-add-overlay -A assets
 javac -nowarn --release 8 -cp "$JAR" -d out/classes $(find src out/gen -name '*.java') 2>&1 | grep -v "^warning\|^Note\|bootstrap" || true
 ls out/classes/app/seek/Main.class >/dev/null
 $BT/dx --dex --min-sdk-version=23 --output=out/classes.dex out/classes

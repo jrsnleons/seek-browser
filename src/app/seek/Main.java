@@ -11,8 +11,10 @@ import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipDescription;
 import android.content.ClipboardManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -131,7 +133,12 @@ public class Main extends Activity {
     ValueCallback<Uri[]> filePick;
     PopupWindow menu;
 
-    boolean folded, picking, floating, pip, barHidden, autohide;
+    boolean folded, picking, floating, pip, barHidden, autohide, letters;
+    Ui.Icon appButton;
+    /** A newer Seek on GitHub, once a check has found one. */
+    Updater.Release update;
+    long updateDownload = -1;
+    Uri updateFile;
     volatile boolean shieldOn, lite;
     int tintShown;
     Tab dragTab;
@@ -155,6 +162,7 @@ public class Main extends Activity {
         fonts();
         lite = store.flag("lite", false);
         autohide = store.flag("autohide", false);
+        letters = store.flag("letters", false);
         maxAwake = memoryBudget();
         Ui.dark = wantsDark(getResources().getConfiguration());
         Ui.black = Ui.dark && store.flag("black", false);
@@ -169,6 +177,9 @@ public class Main extends Activity {
         restore();
         if (!handle(getIntent()) && tabs.isEmpty()) newTab(null, true);
         if (shieldOn && store.flag("easylist", false)) loadLists(false);
+        IntentFilter done = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(downloaded, done, Context.RECEIVER_EXPORTED); else registerReceiver(downloaded, done);
+        ui.postDelayed(new Runnable() { public void run() { checkUpdate(false); } }, 6000);
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -224,10 +235,12 @@ public class Main extends Activity {
         for (Tab t : front()) if (t.view != null) t.view.onResume();
         ui.removeCallbacks(napper);
         ui.postDelayed(napper, NAP_EVERY);
+        if (updateFile != null && canInstall()) install(updateFile);   // back from allowing installs
     }
 
     @Override protected void onDestroy() {
         for (Tab t : tabs) if (t.view != null) { t.view.destroy(); t.view = null; }
+        try { unregisterReceiver(downloaded); } catch (Exception ignored) {}
         net.shutdownNow();
         io.shutdownNow();
         super.onDestroy();
@@ -290,6 +303,8 @@ public class Main extends Activity {
         forward = Ui.icon(this, Ui.Icon.FORWARD, 38);
         reload = Ui.icon(this, Ui.Icon.RELOAD, 38);
         Ui.Icon more = Ui.icon(this, Ui.Icon.MORE, 38);
+        appButton = Ui.icon(this, Ui.Icon.MENU, 38);
+        appButton.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { appMenu(v); } });
         Ui.Icon fold = Ui.icon(this, Ui.Icon.FOLD, 38);
         back.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { goBack(); } });
         forward.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { goForward(); } });
@@ -320,7 +335,7 @@ public class Main extends Activity {
             tabList.setGravity(Gravity.CENTER_VERTICAL);
             hs.addView(tabList, new FrameLayout.LayoutParams(-2, -1));
             column.addView(hs, new LinearLayout.LayoutParams(0, -1, 1));
-            column.addView(more); column.addView(fold);
+            column.addView(more); column.addView(appButton); column.addView(fold);
         } else {
             column.setOrientation(LinearLayout.VERTICAL);
             column.setPadding(Ui.dp(8), Ui.dp(8), Ui.dp(8), Ui.dp(4));
@@ -347,7 +362,7 @@ public class Main extends Activity {
             footer.setGravity(Gravity.CENTER_VERTICAL);
             footer.addView(back); footer.addView(forward); footer.addView(reload);
             footer.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
-            footer.addView(more); footer.addView(fold);
+            footer.addView(more); footer.addView(appButton); footer.addView(fold);
             column.addView(footer, new LinearLayout.LayoutParams(-1, Ui.dp(44)));
         }
 
@@ -540,7 +555,7 @@ public class Main extends Activity {
             chip.setBackground(Ui.round(Ui.dark ? Ui.wash() : Ui.ground(), 14));
             chip.setElevation(Ui.dp(1));
             Ui.Letter icon = new Ui.Letter(this);
-            icon.set(letterOf(host), Icons.get(host));
+            icon.set(letterOf(host), letters ? null : Icons.get(host));
             chip.addView(icon, new FrameLayout.LayoutParams(Ui.dp(24), Ui.dp(24), Gravity.CENTER));
             cell.addView(chip, new LinearLayout.LayoutParams(Ui.dp(52), Ui.dp(52)));
             String name = host == null ? e.title : host.startsWith("www.") ? host.substring(4) : host;
@@ -1070,7 +1085,8 @@ public class Main extends Activity {
     final Map<Tab, Row> rows = new HashMap<>();
     View addRow;
 
-    Bitmap iconOf(Tab t) { return t.icon != null ? t.icon : Icons.get(t.host); }
+    /** The site's icon, or nothing so a letter shows, when Settings asks for letters like Search. */
+    Bitmap iconOf(Tab t) { return letters ? null : t.icon != null ? t.icon : Icons.get(t.host); }
 
     /** Brings the list in line with the tabs, touching only the rows that changed. */
     void refreshTabs() {
@@ -1613,7 +1629,7 @@ public class Main extends Activity {
                 row.setPadding(Ui.dp(18), 0, Ui.dp(8), 0);
                 row.setBackground(Ui.press(t == current ? Ui.hover() : 0, 0));
                 Ui.Letter icon = new Ui.Letter(Main.this);
-                icon.set(t.letter(), t.icon);
+                icon.set(t.letter(), iconOf(t));
                 row.addView(icon, new LinearLayout.LayoutParams(Ui.dp(18), Ui.dp(18)));
                 LinearLayout texts = new LinearLayout(Main.this);
                 texts.setOrientation(LinearLayout.VERTICAL);
@@ -1706,6 +1722,11 @@ public class Main extends Activity {
             if (store.flag("tint", false)) for (Tab t : front()) readTint(t);
             applyTint(); } }));
         list.addView(toggleRow("Your top sites on new tabs", "home", true, new Runnable() { public void run() { showHome(); } }));
+        list.addView(settingRow("Tab icons", letters ? "Letters, like Search" : "Site icons", new View.OnClickListener() { public void onClick(View v) {
+            popup(v, new String[]{"Site icons", "Letters, like Search"}, new Runnable[]{
+                new Runnable() { public void run() { setLetters(false); } },
+                new Runnable() { public void run() { setLetters(true); } } });
+        } }));
         int w = Math.max(0, Math.min(WALLS.length - 1, store.prefs.getInt("wall", 0)));
         list.addView(settingRow("New tab background", WALLS[w], new View.OnClickListener() { public void onClick(View v) {
             Runnable[] acts = new Runnable[WALLS.length];
@@ -1781,8 +1802,13 @@ public class Main extends Activity {
             try { startActivityForResult(i, EXPORT); } catch (Exception e) { toast("No file picker on this tablet"); }
         } }));
 
+        list.addView(section("Updates"));
+        list.addView(toggleRow("Check GitHub for a new Seek once a day", "autoupdate", true, null));
+        list.addView(settingRow("Check now", "You have " + version(), new View.OnClickListener() { public void onClick(View v) {
+            dismissOverlay(); checkUpdate(true); } }));
+
         list.addView(gap());
-        TextView about = Ui.text(this, "Seek 1.2 · a quiet browser after Search by Office Commun. No account, no telemetry; everything stays on this tablet."
+        TextView about = Ui.text(this, "Seek " + version() + " · a quiet browser after Search by Office Commun. No account, no telemetry; everything stays on this tablet."
             + "\n\nHold a tab and drag it onto the page to split the screen, up to three pages. Swipe two fingers right to go back, left to go forward. Pull a page down from the top to reload. Swipe a tab sideways to close it. Hold New tab for a private one."
             + "\n\nInter typeface by Rasmus Andersson, SIL Open Font License 1.1.", 12.5f, Ui.muted());
         about.setSingleLine(false);
@@ -1924,47 +1950,166 @@ public class Main extends Activity {
         popup(v, l.toArray(new String[0]), a.toArray(new Runnable[0]));
     }
 
+    /** The page menu, for the page in front: reading, finding, splitting, sharing. */
     void pageMenu(final View v) {
         final Tab t = current;
-        final boolean hasPage = t != null && t.view != null && t.url != null;
+        if (t == null || t.view == null || t.url == null) { appMenu(v); return; }
         List<String> l = new ArrayList<>();
         List<Runnable> a = new ArrayList<>();
-        if (hasPage) {
-            l.add("Find on page"); a.add(new Runnable() { public void run() { openFind(); } });
-            if (t.reading) { l.add("Leave reading mode"); a.add(new Runnable() { public void run() { t.reading = false; t.view.reload(); refreshChrome(); } }); }
-            else { l.add("Reading mode"); a.add(new Runnable() { public void run() { t.readerAsked = true; t.view.evaluateJavascript(Scripts.reader(Ui.black), null); } }); }
-            l.add("Hide something"); a.add(new Runnable() { public void run() { startPicking(); } });
-            int n = store.hiddenOn(t.host).size();
-            if (n > 0) { l.add("Show what is hidden here (" + n + ")"); a.add(new Runnable() { public void run() {
-                store.unhideAll(t.host); t.view.reload(); } }); }
-            if (Build.VERSION.SDK_INT >= 26) { l.add("Float the video"); a.add(new Runnable() { public void run() { floatVideo(); } }); }
-            l.add("Text size (" + store.zoom(t.host) + "%)"); a.add(new Runnable() { public void run() { textSize(v, t); } });
-            if (shown.size() < MAX_PANES) { l.add(shown.size() > 1 ? "Add a third page" : "Split with another tab"); a.add(new Runnable() { public void run() { switcher(true); } }); }
-            if (shown.size() > 1) {
-                l.add("Take this page out"); a.add(new Runnable() { public void run() { removePane(t); } });
-                l.add("One page again"); a.add(new Runnable() { public void run() { endSplit(); } });
-            }
-            l.add("This site…"); a.add(new Runnable() { public void run() { siteMenu(v, t); } });
-            l.add(null); a.add(null);
-            l.add(store.isBookmarked(t.url) ? "Remove bookmark" : "Bookmark this page"); a.add(new Runnable() { public void run() {
-                toast(store.toggleBookmark(t.url, t.title) ? "Bookmarked" : "Bookmark removed"); } });
-            l.add("Share"); a.add(new Runnable() { public void run() { share(t.url, t.title); } });
-            l.add("Copy address"); a.add(new Runnable() { public void run() { copy(t.url); } });
+        l.add("Find on page"); a.add(new Runnable() { public void run() { openFind(); } });
+        if (t.reading) { l.add("Leave reading mode"); a.add(new Runnable() { public void run() { t.reading = false; t.view.reload(); refreshChrome(); } }); }
+        else { l.add("Reading mode"); a.add(new Runnable() { public void run() { t.readerAsked = true; t.view.evaluateJavascript(Scripts.reader(Ui.black), null); } }); }
+        l.add("Text size (" + store.zoom(t.host) + "%)"); a.add(new Runnable() { public void run() { textSize(v, t); } });
+        l.add(null); a.add(null);
+        if (shown.size() < MAX_PANES) { l.add(shown.size() > 1 ? "Add a third page" : "Split with another tab"); a.add(new Runnable() { public void run() { switcher(true); } }); }
+        if (shown.size() > 1) {
+            l.add("Take this page out"); a.add(new Runnable() { public void run() { removePane(t); } });
+            l.add("One page again"); a.add(new Runnable() { public void run() { endSplit(); } });
+        }
+        if (Build.VERSION.SDK_INT >= 26) { l.add("Float the video"); a.add(new Runnable() { public void run() { floatVideo(); } }); }
+        l.add(null); a.add(null);
+        l.add("Hide something"); a.add(new Runnable() { public void run() { startPicking(); } });
+        int n = store.hiddenOn(t.host).size();
+        if (n > 0) { l.add("Show what is hidden here (" + n + ")"); a.add(new Runnable() { public void run() {
+            store.unhideAll(t.host); t.view.reload(); } }); }
+        l.add("This site…"); a.add(new Runnable() { public void run() { siteMenu(v, t); } });
+        l.add(null); a.add(null);
+        l.add(store.isBookmarked(t.url) ? "Remove bookmark" : "Bookmark this page"); a.add(new Runnable() { public void run() {
+            toast(store.toggleBookmark(t.url, t.title) ? "Bookmarked" : "Bookmark removed"); } });
+        l.add("Share"); a.add(new Runnable() { public void run() { share(t.url, t.title); } });
+        l.add("Copy address"); a.add(new Runnable() { public void run() { copy(t.url); } });
+        menuBy(v, l, a);
+    }
+
+    /** The app menu: tabs, your lists, settings, and an update when there is one. */
+    void appMenu(View v) {
+        List<String> l = new ArrayList<>();
+        List<Runnable> a = new ArrayList<>();
+        if (update != null) {
+            l.add("Update to Seek " + update.version); a.add(new Runnable() { public void run() { offerUpdate(); } });
             l.add(null); a.add(null);
         }
-        l.add("Tabs"); a.add(new Runnable() { public void run() { switcher(false); } });
+        l.add("New tab"); a.add(new Runnable() { public void run() { newTab(null, true); } });
         l.add("New private tab"); a.add(new Runnable() { public void run() { newPrivateTab(); } });
+        l.add("All tabs"); a.add(new Runnable() { public void run() { switcher(false); } });
+        if (!closed.isEmpty()) { l.add("Reopen closed tab"); a.add(new Runnable() { public void run() { reopen(); } }); }
+        l.add(null); a.add(null);
         l.add("Bookmarks"); a.add(new Runnable() { public void run() { listPanel("Bookmarks", store.bookmarks, new Pick() { public void pick(Store.Entry e) {
             store.removeBookmark(e); toast("Bookmark removed"); } }); } });
         l.add("History"); a.add(new Runnable() { public void run() { listPanel("History", store.history, null); } });
         l.add("Downloads"); a.add(new Runnable() { public void run() {
             try { startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)); } catch (Exception e) { toast("No downloads app on this tablet"); } } });
-        if (!closed.isEmpty()) { l.add("Reopen closed tab"); a.add(new Runnable() { public void run() { reopen(); } }); }
+        l.add(null); a.add(null);
         l.add("Settings"); a.add(new Runnable() { public void run() { settings(); } });
+        menuBy(v, l, a);
+    }
+
+    /** A menu beside its button: below it with tabs across the top, above it otherwise. */
+    void menuBy(View v, List<String> l, List<Runnable> a) {
+        int h = 0;
+        for (String s : l) h += s == null ? Ui.dp(13) : Ui.dp(42);
         int[] at = new int[2];
         v.getLocationInWindow(at);
-        String[] labels = l.toArray(new String[0]);
-        popupAt(at[0], top ? at[1] + v.getHeight() : at[1] - Ui.dp(42) * labels.length, labels, a.toArray(new Runnable[0]));
+        popupAt(at[0], top ? at[1] + v.getHeight() : at[1] - h - Ui.dp(12), l.toArray(new String[0]), a.toArray(new Runnable[0]));
+    }
+
+    // ── updates ─────────────────────────────────────────────────
+
+    String version() {
+        try {
+            String v = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            return v != null ? v : "0";
+        } catch (Exception e) { return "0"; }
+    }
+
+    /** Once a day at most, unless asked: is there a newer Seek on GitHub? */
+    void checkUpdate(final boolean asked) {
+        long last = store.prefs.getLong("updateChecked", 0);
+        if (!asked && (!store.flag("autoupdate", true) || System.currentTimeMillis() - last < 20L * 3600 * 1000)) return;
+        if (asked) toast("Checking for updates…");
+        net.execute(new Runnable() { public void run() {
+            Updater.Release r = null;
+            boolean failed = false;
+            try { r = Updater.latest(); } catch (Exception e) { failed = true; }
+            final Updater.Release got = r;
+            final boolean err = failed;
+            ui.post(new Runnable() { public void run() {
+                if (isFinishing()) return;
+                if (!err) store.prefs.edit().putLong("updateChecked", System.currentTimeMillis()).apply();
+                String mine = version();
+                if (got != null && Updater.newer(got.version, mine)) {
+                    update = got;
+                    appButton.tint(Ui.ink());
+                    if (asked) offerUpdate();
+                    else toast("Seek " + got.version + " is ready. It's at the top of the menu.");
+                } else if (asked) toast(err ? "Couldn't reach GitHub. Try again later" : "Seek " + mine + " is the newest");
+            } });
+        } });
+    }
+
+    void offerUpdate() {
+        if (update == null) return;
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        TextView head = Ui.text(this, "Seek " + update.version + " is ready  ·  you have " + version(), 16, Ui.ink());
+        head.setTypeface(Ui.medium());
+        head.setPadding(Ui.dp(18), 0, Ui.dp(18), 0);
+        sheet(head, Ui.dp(54), list, 0.1f);
+        String notes = update.notes == null ? "" : update.notes.replace("**", "").replace("`", "").trim();
+        if (notes.length() > 900) notes = notes.substring(0, 900) + "…";
+        if (!notes.isEmpty()) {
+            TextView t = Ui.text(this, notes, 13.5f, Ui.muted());
+            t.setSingleLine(false);
+            t.setLineSpacing(Ui.dp(3), 1);
+            t.setPadding(Ui.dp(18), Ui.dp(12), Ui.dp(18), Ui.dp(10));
+            list.addView(t);
+        }
+        list.addView(settingRow("Download and install", "", new View.OnClickListener() { public void onClick(View v) { dismissOverlay(); downloadUpdate(); } }));
+        list.addView(settingRow("Later", "", new View.OnClickListener() { public void onClick(View v) { dismissOverlay(); } }));
+    }
+
+    void downloadUpdate() {
+        if (update == null) return;
+        try {
+            String name = "Seek-" + update.version + ".apk";
+            File old = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), name);
+            if (old.exists()) old.delete();
+            DownloadManager.Request r = new DownloadManager.Request(Uri.parse(update.apk));
+            r.setTitle(name);
+            r.setMimeType("application/vnd.android.package-archive");
+            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
+            r.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name);
+            updateDownload = ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
+            toast("Downloading Seek " + update.version + "…");
+        } catch (Exception e) {
+            toast("Couldn't start the download");
+        }
+    }
+
+    final BroadcastReceiver downloaded = new BroadcastReceiver() { public void onReceive(Context c, Intent i) {
+        long id = i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+        if (id < 0 || id != updateDownload) return;
+        updateDownload = -1;
+        Uri u = ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).getUriForDownloadedFile(id);
+        if (u == null) { toast("The update didn't download. Try again from the menu"); return; }
+        updateFile = u;
+        if (canInstall()) install(u);
+        else {
+            toast("Allow Seek to install apps, then come back");
+            try {
+                startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) { install(u); }
+        }
+    } };
+
+    boolean canInstall() { return Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls(); }
+
+    void install(Uri u) {
+        updateFile = null;
+        Intent i = new Intent(Intent.ACTION_VIEW);
+        i.setDataAndType(u, "application/vnd.android.package-archive");
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        try { startActivity(i); } catch (Exception e) { toast("This tablet has no installer for it. Open it from Downloads"); }
     }
 
     void siteMenu(View v, final Tab t) {
@@ -1995,6 +2140,14 @@ public class Main extends Activity {
             a[i] = new Runnable() { public void run() { setZoom(t, pct); } };
         }
         popup(v, l, a);
+    }
+
+    void setLetters(boolean on) {
+        letters = on;
+        store.set("letters", on);
+        refreshTabs();
+        showHome();
+        settings();
     }
 
     void setZoom(Tab t, int pct) {

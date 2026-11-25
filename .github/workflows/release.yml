@@ -1,9 +1,12 @@
-# Pushing a tag like v1.2 publishes a GitHub Release with apk/Seek-1.2.apk attached
-# and notes/v1.2.md as its description.
+# Every APK in apk/ gets its own GitHub Release. When a push to main adds
+# apk/Seek-1.3.apk, this publishes release v1.3 with that APK attached and
+# notes/v1.3.md as its description. Seek checks the latest release for updates.
 name: Release
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths: ['apk/**', 'notes/**', '.github/workflows/release.yml']
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
@@ -11,18 +14,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Publish the release
+      - name: Publish a release for each new APK
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: |
-          VER="${TAG#v}"
-          APK="apk/Seek-$VER.apk"
-          test -f "$APK" || { echo "missing $APK"; exit 1; }
-          NOTES="notes/$TAG.md"
-          [ -f "$NOTES" ] || { echo "Seek $VER" > /tmp/notes.md; NOTES=/tmp/notes.md; }
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$APK" --clobber
-          else
-            gh release create "$TAG" "$APK" --title "Seek $VER" --notes-file "$NOTES" --verify-tag
-          fi
+          for APK in $(ls apk/Seek-*.apk | sort -V); do
+            VER=$(basename "$APK" .apk); VER="${VER#Seek-}"; TAG="v$VER"
+            if gh release view "$TAG" >/dev/null 2>&1; then echo "$TAG already released"; continue; fi
+            NOTES="notes/$TAG.md"
+            [ -f "$NOTES" ] || { echo "Seek $VER" > /tmp/notes.md; NOTES=/tmp/notes.md; }
+            gh release create "$TAG" "$APK" --target "$GITHUB_SHA" --title "Seek $VER" --notes-file "$NOTES" --latest=false
+          done
+          LAST=$(ls apk/Seek-*.apk | sort -V | tail -1); LAST=$(basename "$LAST" .apk)
+          gh release edit "v${LAST#Seek-}" --latest

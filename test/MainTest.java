@@ -31,7 +31,7 @@ public class MainTest {
         return c.get();
     }
 
-    @Test public void everything() {
+    @Test public void everything() throws Exception {
         Main m = launch(new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/")));
         assertNotNull(m.current);
         assertEquals("https://example.com/", m.current.url);
@@ -96,6 +96,13 @@ public class MainTest {
         m.close(c); idle();
         assertEquals(1, m.tabs.size());
 
+        // updates
+        assertTrue(Updater.newer("1.10", "1.9")); assertTrue(Updater.newer("1.3", "1.2"));
+        assertFalse(Updater.newer("1.2", "1.2")); assertFalse(Updater.newer("1.2", "1.3"));
+        Updater.Release r = Updater.parse(new org.json.JSONObject("{\"tag_name\":\"v1.4\",\"body\":\"**New** things\",\"assets\":[{\"name\":\"Seek-1.4.apk\",\"browser_download_url\":\"https://github.com/jrsnleons/seek-browser/releases/download/v1.4/Seek-1.4.apk\"}]}"));
+        assertEquals("1.4", r.version);
+        m.update = r; m.appMenu(m.root); m.menu.dismiss(); m.offerUpdate(); idle(); m.dismissOverlay(); m.update = null;
+
         // small pieces
         assertEquals(0xFFFF0000, Main.parseColor("#f00"));
         assertEquals(0xFF102030, Main.parseColor("rgb(16, 32, 48)"));
@@ -116,6 +123,12 @@ public class MainTest {
         clickAllText(m.menu.getContentView(), labels);
         System.out.println("MENU: " + labels);
         m.menu.dismiss();
+        m.appMenu(m.root); idle();
+        labels.clear(); clickAllText(m.menu.getContentView(), labels);
+        System.out.println("APP MENU: " + labels);
+        assertTrue(labels.contains("Settings")); assertFalse(labels.contains("Find on page"));
+        m.menu.dismiss();
+        m.setLetters(true); assertNull(m.iconOf(m.current)); m.dismissOverlay(); m.setLetters(false); m.dismissOverlay();
         m.siteMenu(m.root, m.current); m.menu.dismiss();
         m.textSize(m.root, m.current); m.menu.dismiss();
         m.setZoom(m.current, 125);

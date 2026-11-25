@@ -82,7 +82,7 @@ final class Ui {
 
     /** Drawn icons, a stroke each, so they look the same whatever fonts the tablet has. */
     static final class Icon extends View {
-        static final int BACK = 1, FORWARD = 2, RELOAD = 3, MORE = 4, FOLD = 5, CLOSE = 6, PLUS = 7, UP = 8, DOWN = 9, STOP = 10, TABS = 11;
+        static final int BACK = 1, FORWARD = 2, RELOAD = 3, MORE = 4, FOLD = 5, CLOSE = 6, PLUS = 7, UP = 8, DOWN = 9, STOP = 10, TABS = 11, MENU = 12;
         int kind;
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Path path = new Path();
@@ -146,6 +146,10 @@ final class Ui {
                     path.moveTo(cx - r * 0.95f, cy + r * 0.6f); path.lineTo(cx - r * 0.95f, cy - r * 0.95f); path.lineTo(cx + r * 0.6f, cy - r * 0.95f);
                     cv.drawPath(path, p); break;
                 }
+                case MENU:
+                    cv.drawLine(cx - r * 0.75f, cy - r * 0.55f, cx + r * 0.75f, cy - r * 0.55f, p);
+                    cv.drawLine(cx - r * 0.75f, cy, cx + r * 0.75f, cy, p);
+                    cv.drawLine(cx - r * 0.75f, cy + r * 0.55f, cx + r * 0.75f, cy + r * 0.55f, p); break;
                 case FOLD: {
                     RectF o = new RectF(cx - r, cy - r * 0.8f, cx + r, cy + r * 0.8f);
                     cv.drawRoundRect(o, dp(2.5f), dp(2.5f), p);

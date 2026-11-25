@@ -18,13 +18,16 @@ Search runs on the Mac's WebKit. Android has no WebKit, so Seek uses the tablet'
 - **Optional looks:** subtle motion (on by default), a frame tinted to match each site, a top bar that hides while you scroll, compact density, and the Inter typeface.
 - **Fast on modest tablets:** ads hidden before a page is drawn, background tabs paused and put to sleep after 30 idle minutes, a background-tab budget set from the tablet's memory, addresses looked up while you type, site icons kept on disk, and an optional Lite mode with no autoplay video and no web fonts.
 - **Bookmarks, history and downloads**, with bookmark import and export as HTML.
+- **Two menus:** ••• for the page in front, ☰ for the app. Tab icons can be letters, like Search.
 - **Gestures:** swipe two fingers right to go back and left to go forward, and pull down from the top to reload.
 
 Private tabs keep no history, but they share cookies with normal tabs, because Android WebView allows one cookie store per app.
 
 ## Install
 
-Download [apk/Seek-1.2.apk](apk/Seek-1.2.apk) on the tablet (press "Download raw file"), open it on the tablet, and allow installs from unknown sources. On Huawei tablets, turn off Pure Mode first. HarmonyOS NEXT (5.x) can't install APKs.
+Get the APK from the [latest release](https://github.com/jrsnleons/seek-browser/releases/latest), or download [apk/Seek-1.3.apk](apk/Seek-1.3.apk) on the tablet (press "Download raw file"), open it on the tablet, and allow installs from unknown sources. On Huawei tablets, turn off Pure Mode first. HarmonyOS NEXT (5.x) can't install APKs.
+
+After that, Seek updates itself: once a day it checks this repository's latest release and offers it at the top of the menu. Each APK in `apk/` is published as a release by `.github/workflows/release.yml`.
 
 ## Build
 
