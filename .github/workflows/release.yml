@@ -1,0 +1,28 @@
+# Pushing a tag like v1.2 publishes a GitHub Release with apk/Seek-1.2.apk attached
+# and notes/v1.2.md as its description.
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          VER="${TAG#v}"
+          APK="apk/Seek-$VER.apk"
+          test -f "$APK" || { echo "missing $APK"; exit 1; }
+          NOTES="notes/$TAG.md"
+          [ -f "$NOTES" ] || { echo "Seek $VER" > /tmp/notes.md; NOTES=/tmp/notes.md; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" --title "Seek $VER" --notes-file "$NOTES" --verify-tag
+          fi
