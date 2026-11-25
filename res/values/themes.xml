@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Launch" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">#F4F4F4</item>
+        <item name="android:navigationBarColor">#F4F4F4</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <style name="Light" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:colorAccent">#171717</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <style name="Dark" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/frame_dark</item>
+        <item name="android:colorAccent">#EDEDED</item>
+    </style>
+    <style name="Black" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/pure_black</item>
+        <item name="android:colorAccent">#EDEDED</item>
+        <item name="android:colorBackground">@color/pure_black</item>
+    </style>
+</resources>

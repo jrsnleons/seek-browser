@@ -1,0 +1,2089 @@
+package app.seek;
+
+import android.app.Activity;
+import android.app.DownloadManager;
+import android.app.PictureInPictureParams;
+import android.app.SearchManager;
+import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.Intent;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
+import android.util.Rational;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
+import android.view.Window;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.webkit.CookieManager;
+import android.webkit.GeolocationPermissions;
+import android.webkit.JavascriptInterface;
+import android.webkit.PermissionRequest;
+import android.webkit.URLUtil;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebStorage;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.GridLayout;
+import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.PopupWindow;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
+
+/**
+ * A row of tabs and the page. No start page, nothing that wants your attention.
+ * One field: an address goes there, words search.
+ */
+public class Main extends Activity {
+
+    static final int MAX_AWAKE = 4;   // web views kept alive besides the ones in front
+    static final int FILE_PICK = 7, EXPORT = 8, IMPORT = 9, WALL = 10;
+
+    Store store;
+    final List<Tab> tabs = new ArrayList<>();
+    final List<String> closed = new ArrayList<>();
+    /** The tab in front; with two pages side by side, left and right, and current is one of them. */
+    Tab current, left, right;
+    float ratio = 0.5f;
+    final Handler ui = new Handler(Looper.getMainLooper());
+    final ExecutorService net = Executors.newSingleThreadExecutor();
+
+    // the frame
+    boolean top;
+    FrameLayout root;
+    LinearLayout body, column, tabList;
+    GridLayout pins;
+    TextView field;
+    FrameLayout page, paneA, paneB;
+    LinearLayout stage;
+    View divider, progress;
+    ImageView blank;
+    Ui.Icon back, forward, reload, handle, pullDot;
+    LinearLayout findBar, hideBar;
+    EditText findInput;
+    TextView findCount;
+    FrameLayout overlay;
+    View fullscreen;
+    WebChromeClient.CustomViewCallback fullscreenDone;
+    ValueCallback<Uri[]> filePick;
+    PopupWindow menu;
+
+    boolean folded, picking, floating, pip;
+    volatile boolean shieldOn;
+    volatile Set<String> paused = new HashSet<>();
+    Set<String> awake = new HashSet<>();
+    float touchX, touchY;
+    String mobileUA, desktopUA;
+
+    // ── life ────────────────────────────────────────────────────
+
+    @Override protected void onCreate(Bundle saved) {
+        super.onCreate(saved);
+        store = new Store(this);
+        Ui.density = getResources().getDisplayMetrics().density;
+        Ui.dark = wantsDark(getResources().getConfiguration());
+        Ui.black = Ui.dark && store.flag("black", false);
+        setTheme(getResources().getIdentifier(Ui.black ? "Black" : Ui.dark ? "Dark" : "Light", "style", getPackageName()));
+        shieldOn = store.flag("shield", true);
+        paused = store.paused();
+        awake = store.awake();
+        folded = store.flag("folded", false);
+        top = store.flag("top", false);
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+        build();
+        restore();
+        if (!handle(getIntent()) && tabs.isEmpty()) newTab(null, true);
+        if (shieldOn && store.flag("easylist", false)) loadLists(false);
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        handle(intent);
+    }
+
+    boolean inPip() { return Build.VERSION.SDK_INT >= 24 && isInPictureInPictureMode(); }
+
+    @Override protected void onPause() {
+        super.onPause();
+        saveSession();
+        store.flush();
+        CookieManager.getInstance().flush();
+        if (inPip()) return;   // the floating video keeps playing
+        for (Tab t : front()) if (t.view != null) t.view.onPause();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        for (Tab t : front()) if (t.view != null) t.view.onResume();
+    }
+
+    @Override protected void onDestroy() {
+        for (Tab t : tabs) if (t.view != null) { t.view.destroy(); t.view = null; }
+        net.shutdownNow();
+        super.onDestroy();
+    }
+
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_RUNNING_LOW) for (Tab t : new ArrayList<>(tabs)) if (!keptAwake(t)) sleep(t);
+    }
+
+    @Override public void onConfigurationChanged(Configuration c) {
+        super.onConfigurationChanged(c);
+        if (wantsDark(c) != Ui.dark && !inPip()) { saveSession(); recreate(); }
+    }
+
+    boolean wantsDark(Configuration c) {
+        int look = store.look();
+        if (look == 1) return false;
+        if (look == 2) return true;
+        return (c.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+    }
+
+    List<Tab> front() {
+        List<Tab> l = new ArrayList<>();
+        if (left != null) l.add(left);
+        if (right != null) l.add(right);
+        if (current != null && !l.contains(current)) l.add(current);
+        return l;
+    }
+
+    // ── building the frame ──────────────────────────────────────
+
+    void bars() {
+        Window w = getWindow();
+        w.setStatusBarColor(Ui.frame());
+        w.setNavigationBarColor(Ui.frame());
+        int flags = 0;
+        if (!Ui.dark) {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        w.getDecorView().setSystemUiVisibility(flags);
+    }
+
+    void build() {
+        bars();
+        root = new FrameLayout(this);
+        root.setBackgroundColor(Ui.frame());
+
+        body = new LinearLayout(this);
+        body.setOrientation(top ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+        root.addView(body, new FrameLayout.LayoutParams(-1, -1));
+
+        field = Ui.text(this, "", 14, Ui.muted());
+        field.setPadding(Ui.dp(12), 0, Ui.dp(12), 0);
+        field.setBackground(Ui.press(Ui.tile(), 9));
+        field.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { openField(); } });
+        field.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { switcher(false); return true; } });
+
+        back = Ui.icon(this, Ui.Icon.BACK, 38);
+        forward = Ui.icon(this, Ui.Icon.FORWARD, 38);
+        reload = Ui.icon(this, Ui.Icon.RELOAD, 38);
+        Ui.Icon more = Ui.icon(this, Ui.Icon.MORE, 38);
+        Ui.Icon fold = Ui.icon(this, Ui.Icon.FOLD, 38);
+        back.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { goBack(); } });
+        forward.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { goForward(); } });
+        reload.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+            WebView wv = live();
+            if (wv == null) return;
+            if (current.progress < 100) wv.stopLoading(); else wv.reload();
+        } });
+        more.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { pageMenu(v); } });
+        fold.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { fold(true); } });
+
+        tabList = new LinearLayout(this);
+        column = new LinearLayout(this);
+        if (top) {
+            // tabs across the top: one row with the field and the buttons on it
+            column.setOrientation(LinearLayout.HORIZONTAL);
+            column.setGravity(Gravity.CENTER_VERTICAL);
+            column.setPadding(Ui.dp(6), Ui.dp(4), Ui.dp(6), Ui.dp(4));
+            body.addView(column, new LinearLayout.LayoutParams(-1, Ui.dp(52)));
+            column.addView(back); column.addView(forward); column.addView(reload);
+            LinearLayout.LayoutParams fl = new LinearLayout.LayoutParams(Ui.dp(250), Ui.dp(36));
+            fl.setMargins(Ui.dp(6), 0, Ui.dp(10), 0);
+            column.addView(field, fl);
+            HorizontalScrollView hs = new HorizontalScrollView(this);
+            hs.setHorizontalScrollBarEnabled(false);
+            hs.setOverScrollMode(View.OVER_SCROLL_NEVER);
+            tabList.setOrientation(LinearLayout.HORIZONTAL);
+            tabList.setGravity(Gravity.CENTER_VERTICAL);
+            hs.addView(tabList, new FrameLayout.LayoutParams(-2, -1));
+            column.addView(hs, new LinearLayout.LayoutParams(0, -1, 1));
+            column.addView(more); column.addView(fold);
+        } else {
+            column.setOrientation(LinearLayout.VERTICAL);
+            column.setPadding(Ui.dp(8), Ui.dp(8), Ui.dp(8), Ui.dp(4));
+            body.addView(column, new LinearLayout.LayoutParams(Ui.dp(236), -1));
+            column.addView(field, new LinearLayout.LayoutParams(-1, Ui.dp(38)));
+
+            pins = new GridLayout(this);
+            pins.setColumnCount(5);
+            LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(-1, -2);
+            pl.topMargin = Ui.dp(10);
+            column.addView(pins, pl);
+
+            ScrollView scroll = new ScrollView(this);
+            scroll.setVerticalScrollBarEnabled(false);
+            scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+            tabList.setOrientation(LinearLayout.VERTICAL);
+            scroll.addView(tabList, new FrameLayout.LayoutParams(-1, -2));
+            LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, 0, 1);
+            sl.topMargin = Ui.dp(8);
+            column.addView(scroll, sl);
+
+            LinearLayout footer = new LinearLayout(this);
+            footer.setOrientation(LinearLayout.HORIZONTAL);
+            footer.setGravity(Gravity.CENTER_VERTICAL);
+            footer.addView(back); footer.addView(forward); footer.addView(reload);
+            footer.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+            footer.addView(more); footer.addView(fold);
+            column.addView(footer, new LinearLayout.LayoutParams(-1, Ui.dp(44)));
+        }
+
+        // the page, a card beside the tabs; with Split View, two
+        page = new FrameLayout(this);
+        body.addView(page, top ? new LinearLayout.LayoutParams(-1, 0, 1) : new LinearLayout.LayoutParams(0, -1, 1));
+
+        stage = new LinearLayout(this);
+        stage.setOrientation(LinearLayout.HORIZONTAL);
+        page.addView(stage, new FrameLayout.LayoutParams(-1, -1));
+        paneA = pane();
+        paneB = pane();
+        divider = buildDivider();
+        stage.addView(paneA, new LinearLayout.LayoutParams(0, -1, 1));
+        stage.addView(divider, new LinearLayout.LayoutParams(Ui.dp(10), -1));
+        stage.addView(paneB, new LinearLayout.LayoutParams(0, -1, 1));
+        divider.setVisibility(View.GONE);
+        paneB.setVisibility(View.GONE);
+
+        blank = new ImageView(this);
+        blank.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        blank.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { openField(); } });
+        paneA.addView(blank, new FrameLayout.LayoutParams(-1, -1));
+        wallpaper();
+
+        progress = new View(this);
+        progress.setBackgroundColor(Ui.ink());
+        progress.setPivotX(0);
+        progress.setVisibility(View.GONE);
+        page.addView(progress, new FrameLayout.LayoutParams(-1, Ui.dp(2), Gravity.TOP));
+
+        pullDot = Ui.icon(this, Ui.Icon.RELOAD, 38);
+        pullDot.setBackground(Ui.card());
+        pullDot.setElevation(Ui.dp(4));
+        pullDot.setVisibility(View.GONE);
+        page.addView(pullDot, new FrameLayout.LayoutParams(Ui.dp(38), Ui.dp(38), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+
+        buildFindBar();
+        buildHideBar();
+
+        handle = Ui.icon(this, Ui.Icon.FOLD, 42);
+        handle.setBackground(Ui.press(Ui.dark ? Ui.wash() : Ui.frame(), 21));
+        handle.setElevation(Ui.dp(3));
+        FrameLayout.LayoutParams hl = new FrameLayout.LayoutParams(Ui.dp(42), Ui.dp(42), Gravity.BOTTOM | Gravity.LEFT);
+        hl.leftMargin = Ui.dp(12); hl.bottomMargin = Ui.dp(14);
+        root.addView(handle, hl);
+        handle.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { fold(false); } });
+        handle.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { switcher(false); return true; } });
+
+        setContentView(root);
+        fold(folded);
+    }
+
+    FrameLayout pane() {
+        FrameLayout p = new FrameLayout(this);
+        p.setBackground(Ui.round(Ui.ground(), 12));
+        p.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+        p.setClipToOutline(true);
+        return p;
+    }
+
+    View buildDivider() {
+        FrameLayout d = new FrameLayout(this);
+        View grip = new View(this);
+        grip.setBackground(Ui.round(Ui.faint(), 2));
+        d.addView(grip, new FrameLayout.LayoutParams(Ui.dp(3), Ui.dp(36), Gravity.CENTER));
+        d.setOnTouchListener(new View.OnTouchListener() { public boolean onTouch(View v, MotionEvent e) {
+            if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                int[] at = new int[2];
+                stage.getLocationOnScreen(at);
+                float r = (e.getRawX() - at[0]) / Math.max(1f, stage.getWidth());
+                ratio = Math.max(0.2f, Math.min(0.8f, r));
+                applyRatio();
+            } else if (e.getActionMasked() == MotionEvent.ACTION_UP) saveSoon();
+            return true;
+        } });
+        return d;
+    }
+
+    void applyRatio() {
+        LinearLayout.LayoutParams a = (LinearLayout.LayoutParams) paneA.getLayoutParams();
+        LinearLayout.LayoutParams b = (LinearLayout.LayoutParams) paneB.getLayoutParams();
+        a.weight = right == null ? 1 : ratio;
+        b.weight = 1 - ratio;
+        paneA.setLayoutParams(a);
+        paneB.setLayoutParams(b);
+    }
+
+    void fold(boolean f) {
+        folded = f;
+        store.set("folded", f);
+        boolean hide = f || pip;
+        column.setVisibility(hide ? View.GONE : View.VISIBLE);
+        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) page.getLayoutParams();
+        int m = hide ? 0 : Ui.dp(8);
+        if (top) lp.setMargins(m, 0, m, m); else lp.setMargins(0, m, m, m);
+        page.setLayoutParams(lp);
+        float r = hide && right == null ? 0 : 12;
+        paneA.setBackground(Ui.round(Ui.ground(), r));
+        paneB.setBackground(Ui.round(Ui.ground(), 12));
+        handle.setVisibility(f && !pip ? View.VISIBLE : View.GONE);
+        handle.setAlpha(0.85f);
+        outlines();
+    }
+
+    /** With two pages side by side, the one that gets page commands wears a thin outline. */
+    void outlines() {
+        if (right == null || pip) { paneA.setForeground(null); paneB.setForeground(null); return; }
+        GradientDrawable o = new GradientDrawable();
+        o.setColor(0);
+        o.setCornerRadius(Ui.dp(12));
+        o.setStroke(Ui.dp(1.5f), Ui.dark ? 0xFF5A5A5A : 0xFFB8B8B8);
+        paneA.setForeground(current == left ? o : null);
+        paneB.setForeground(current == right ? o : null);
+    }
+
+    /** The empty tab: the page's own ground, or the wall chosen in Settings. */
+    static final String[] WALLS = {"None", "Paper", "Sage", "Dusk", "Sea", "Sand", "Photo…"};
+    static final int[][] WALL_LIGHT = {{}, {0xFFF4F1EA, 0xFFF4F1EA}, {0xFFDDE6D8, 0xFFF4F1E8}, {0xFFEAD9E5, 0xFFD6DCF0}, {0xFFD3E6EE, 0xFFF1F6F4}, {0xFFF0E1CC, 0xFFF8F2E8}};
+    static final int[][] WALL_DARK = {{}, {0xFF1A1815, 0xFF1A1815}, {0xFF17221A, 0xFF0B0F0C}, {0xFF261B2C, 0xFF121829}, {0xFF0E2129, 0xFF070E11}, {0xFF2A2015, 0xFF120E09}};
+
+    void wallpaper() {
+        int w = Math.max(0, Math.min(WALLS.length - 1, store.prefs.getInt("wall", 0)));
+        blank.setImageDrawable(null);
+        if (w == 0) { blank.setBackgroundColor(Ui.ground()); return; }
+        if (w == WALLS.length - 1) {
+            blank.setBackgroundColor(Ui.ground());
+            File f = new File(getFilesDir(), "wall.jpg");
+            if (f.exists()) {
+                Bitmap b = BitmapFactory.decodeFile(f.getPath());
+                if (b != null) blank.setImageBitmap(b);
+            }
+            return;
+        }
+        int[] c = (Ui.dark ? WALL_DARK : WALL_LIGHT)[w];
+        blank.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR, c));
+    }
+
+    void buildFindBar() {
+        findBar = new LinearLayout(this);
+        findBar.setOrientation(LinearLayout.HORIZONTAL);
+        findBar.setGravity(Gravity.CENTER_VERTICAL);
+        findBar.setBackground(Ui.card());
+        findBar.setElevation(Ui.dp(4));
+        findBar.setPadding(Ui.dp(14), 0, Ui.dp(6), 0);
+        findInput = input("Find on page", 15);
+        findBar.addView(findInput, new LinearLayout.LayoutParams(0, -1, 1));
+        findCount = Ui.text(this, "", 13, Ui.muted());
+        findCount.setPadding(Ui.dp(8), 0, Ui.dp(8), 0);
+        findBar.addView(findCount, new LinearLayout.LayoutParams(-2, -1));
+        Ui.Icon up = Ui.icon(this, Ui.Icon.UP, 36), down = Ui.icon(this, Ui.Icon.DOWN, 36), x = Ui.icon(this, Ui.Icon.CLOSE, 36);
+        findBar.addView(up); findBar.addView(down); findBar.addView(x);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Ui.dp(420), Ui.dp(48), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        lp.bottomMargin = Ui.dp(14);
+        findBar.setVisibility(View.GONE);
+        page.addView(findBar, lp);
+        findInput.addTextChangedListener(new Watch() { public void afterTextChanged(Editable s) {
+            if (live() != null) { live().findAllAsync(s.toString()); if (s.length() == 0) findCount.setText(""); }
+        } });
+        findInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        findInput.setOnEditorActionListener(new TextView.OnEditorActionListener() { public boolean onEditorAction(TextView v, int a, KeyEvent e) {
+            if (live() != null) live().findNext(true); return true; } });
+        up.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (live() != null) live().findNext(false); } });
+        down.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (live() != null) live().findNext(true); } });
+        x.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { closeFind(); } });
+    }
+
+    void openFind() {
+        if (live() == null) return;
+        findBar.setVisibility(View.VISIBLE);
+        findBar.bringToFront();
+        findInput.requestFocus();
+        keyboard(findInput, true);
+        if (findInput.length() > 0) live().findAllAsync(findInput.getText().toString());
+    }
+
+    void closeFind() {
+        findBar.setVisibility(View.GONE);
+        keyboard(findInput, false);
+        if (live() != null) live().clearMatches();
+    }
+
+    void buildHideBar() {
+        hideBar = new LinearLayout(this);
+        hideBar.setOrientation(LinearLayout.HORIZONTAL);
+        hideBar.setGravity(Gravity.CENTER_VERTICAL);
+        hideBar.setBackground(Ui.card());
+        hideBar.setElevation(Ui.dp(4));
+        hideBar.setPadding(Ui.dp(16), 0, Ui.dp(6), 0);
+        TextView t = Ui.text(this, "Tap anything to hide it, here and on every visit", 14, Ui.ink());
+        hideBar.addView(t, new LinearLayout.LayoutParams(0, -1, 1));
+        TextView done = Ui.text(this, "Done", 14, Ui.ink());
+        done.setTypeface(Ui.medium());
+        done.setPadding(Ui.dp(14), 0, Ui.dp(14), 0);
+        done.setBackground(Ui.press(Ui.tile(), 8));
+        hideBar.addView(done, new LinearLayout.LayoutParams(-2, Ui.dp(34)));
+        done.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { stopPicking(); } });
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Ui.dp(460), Ui.dp(50), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        lp.bottomMargin = Ui.dp(14);
+        hideBar.setVisibility(View.GONE);
+        page.addView(hideBar, lp);
+    }
+
+    void startPicking() {
+        if (live() == null) return;
+        picking = true;
+        hideBar.setVisibility(View.VISIBLE);
+        hideBar.bringToFront();
+        live().evaluateJavascript(Scripts.PICK, null);
+    }
+
+    void stopPicking() {
+        picking = false;
+        hideBar.setVisibility(View.GONE);
+        for (Tab t : front()) if (t.view != null) t.view.evaluateJavascript(Scripts.UNPICK, null);
+    }
+
+    // ── tabs ────────────────────────────────────────────────────
+
+    WebView live() { return current == null ? null : current.view; }
+
+    Tab newTab(String url, boolean select) {
+        Tab t = new Tab(url, null, false);
+        int at = current == null ? tabs.size() : tabs.indexOf(current) + 1;
+        if (current != null && current.pinned) at = tabs.size();
+        tabs.add(Math.max(0, Math.min(at, tabs.size())), t);
+        if (select) select(t);
+        else refreshTabs();
+        if (select && url == null) openField();
+        saveSoon();
+        return t;
+    }
+
+    void newPrivateTab() {
+        Tab t = new Tab(null, null, false);
+        t.priv = true;
+        tabs.add(t);
+        select(t);
+        openField();
+    }
+
+    static void detach(View v) {
+        if (v != null && v.getParent() != null) ((ViewGroup) v.getParent()).removeView(v);
+    }
+
+    void select(Tab t) {
+        if (picking) stopPicking();
+        if (findBar.getVisibility() == View.VISIBLE) closeFind();
+        if (right != null && t != left && t != right) endSplit();
+        t.used = System.currentTimeMillis();
+        if (right != null) {           // one of the two in front: it just takes the page commands
+            current = t;
+            outlines(); refreshTabs(); refreshChrome();
+            return;
+        }
+        if (left != null && left != t && left.view != null) {
+            left.view.onPause();
+            detach(left.view);
+        }
+        left = current = t;
+        if (t.view == null && t.url != null) wake(t);
+        if (t.view != null) {
+            detach(t.view);
+            paneA.addView(t.view, 0, new FrameLayout.LayoutParams(-1, -1));
+            t.view.onResume();
+            t.view.requestFocus();
+        }
+        blank.setVisibility(t.view == null ? View.VISIBLE : View.GONE);
+        trim();
+        refreshTabs();
+        refreshChrome();
+        saveSoon();
+    }
+
+    /** Two pages side by side: the one in front, and this one on the right. */
+    void split(Tab other) {
+        if (other == null || other == current) return;
+        if (right != null) endSplit();
+        if (current == null || current.view == null) { toast("Open a page first"); return; }
+        if (other.view == null) { if (other.url == null) return; wake(other); }
+        left = current;
+        right = other;
+        other.used = System.currentTimeMillis();
+        detach(other.view);
+        paneB.addView(other.view, 0, new FrameLayout.LayoutParams(-1, -1));
+        other.view.onResume();
+        paneB.setVisibility(View.VISIBLE);
+        divider.setVisibility(View.VISIBLE);
+        applyRatio();
+        fold(folded);
+        refreshTabs();
+        saveSoon();
+    }
+
+    /** Back to one page: the one that had the page commands keeps the whole area. */
+    void endSplit() {
+        if (right == null) return;
+        Tab keep = current == right ? right : left;
+        Tab other = keep == left ? right : left;
+        if (other.view != null) { other.view.onPause(); detach(other.view); }
+        if (keep == right && keep.view != null) {
+            detach(keep.view);
+            paneA.addView(keep.view, 0, new FrameLayout.LayoutParams(-1, -1));
+        }
+        left = current = keep;
+        right = null;
+        paneB.setVisibility(View.GONE);
+        divider.setVisibility(View.GONE);
+        blank.setVisibility(keep.view == null ? View.VISIBLE : View.GONE);
+        applyRatio();
+        fold(folded);
+        trim();
+        refreshTabs();
+        refreshChrome();
+        saveSoon();
+    }
+
+    void focusPane(Tab t) {
+        if (right == null || t == current || (t != left && t != right)) return;
+        current = t;
+        outlines(); refreshTabs(); refreshChrome();
+    }
+
+    void close(Tab t) {
+        int i = tabs.indexOf(t);
+        if (i < 0) return;
+        if (right != null && (t == left || t == right)) {
+            current = t == left ? right : left;
+            endSplit();
+        }
+        if (t.url != null && !t.priv) { closed.add(t.url); if (closed.size() > 20) closed.remove(0); }
+        tabs.remove(i);
+        if (t.view != null) {
+            detach(t.view);
+            t.view.destroy();
+            t.view = null;
+        }
+        if (t == current) {
+            current = left = null;
+            Tab next = null;
+            if (t.opener != null && tabs.contains(t.opener)) next = t.opener;
+            else if (!tabs.isEmpty()) next = tabs.get(Math.min(i, tabs.size() - 1));
+            if (next != null) select(next);
+            else newTab(null, true);
+        } else refreshTabs();
+        saveSoon();
+    }
+
+    void reopen() {
+        if (closed.isEmpty()) return;
+        String u = closed.remove(closed.size() - 1);
+        Tab t = newTab(null, false);
+        t.url = u;
+        t.host = Tab.hostOf(u);
+        select(t);
+    }
+
+    boolean keptAwake(Tab t) {
+        return t == current || t == left || t == right || (t.host != null && awake.contains(t.host));
+    }
+
+    /** Put to sleep: the page goes, the tab and its address stay. */
+    void sleep(Tab t) {
+        if (t.view == null || t == current || t == left || t == right) return;
+        detach(t.view);
+        t.view.destroy();
+        t.view = null;
+    }
+
+    void trim() {
+        List<Tab> sleepy = new ArrayList<>();
+        for (Tab t : tabs) if (t.view != null && !keptAwake(t)) sleepy.add(t);
+        while (sleepy.size() > MAX_AWAKE) {
+            Tab oldest = sleepy.get(0);
+            for (Tab t : sleepy) if (t.used < oldest.used) oldest = t;
+            sleepy.remove(oldest);
+            sleep(oldest);
+        }
+    }
+
+    void wake(Tab t) {
+        t.view = makeView(t);
+        if (t.url != null) t.view.loadUrl(t.url);
+    }
+
+    void load(String url) {
+        if (current == null) select(newTab(null, false));
+        Tab t = current;
+        t.url = url;
+        t.host = Tab.hostOf(url);
+        if (t.view == null) select(t);   // builds and loads it
+        else t.view.loadUrl(url);
+        if (t == left) blank.setVisibility(View.GONE);
+        refreshChrome();
+    }
+
+    // ── the row of tabs ─────────────────────────────────────────
+
+    void refreshTabs() {
+        tabList.removeAllViews();
+        if (pins != null) pins.removeAllViews();
+        int pinCount = 0;
+        for (final Tab t : tabs) {
+            if (t.pinned) {
+                View tile = pinTile(t);
+                if (top) {
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(Ui.dp(38), Ui.dp(34));
+                    lp.rightMargin = Ui.dp(4);
+                    tabList.addView(tile, lp);
+                } else {
+                    GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+                    lp.width = Ui.dp(38); lp.height = Ui.dp(34);
+                    lp.setMargins(0, 0, Ui.dp(6), Ui.dp(6));
+                    pins.addView(tile, lp);
+                }
+                pinCount++;
+            } else {
+                View row = tabRow(t);
+                LinearLayout.LayoutParams lp = top ? new LinearLayout.LayoutParams(Ui.dp(190), Ui.dp(36)) : new LinearLayout.LayoutParams(-1, Ui.dp(36));
+                if (top) lp.rightMargin = Ui.dp(4); else lp.bottomMargin = Ui.dp(2);
+                tabList.addView(row, lp);
+            }
+        }
+        if (pins != null) pins.setVisibility(pinCount == 0 ? View.GONE : View.VISIBLE);
+
+        // New tab, faint, at the end of the row; held down, a private one
+        LinearLayout add = new LinearLayout(this);
+        add.setOrientation(LinearLayout.HORIZONTAL);
+        add.setGravity(Gravity.CENTER_VERTICAL);
+        add.setPadding(Ui.dp(6), 0, Ui.dp(8), 0);
+        add.setBackground(Ui.press(0, 8));
+        Ui.Icon plus = new Ui.Icon(this, Ui.Icon.PLUS);
+        plus.tint(Ui.faint());
+        add.addView(plus, new LinearLayout.LayoutParams(Ui.dp(22), Ui.dp(22)));
+        if (!top) {
+            TextView l = Ui.text(this, "New tab", 14, Ui.faint());
+            l.setPadding(Ui.dp(8), 0, 0, 0);
+            add.addView(l);
+        }
+        add.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { newTab(null, true); } });
+        add.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { newPrivateTab(); return true; } });
+        tabList.addView(add, new LinearLayout.LayoutParams(top ? Ui.dp(36) : -1, Ui.dp(36)));
+    }
+
+    View tabRow(final Tab t) {
+        boolean liveRow = t == current;
+        boolean beside = right != null && (t == left || t == right) && !liveRow;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Ui.dp(8), 0, Ui.dp(2), 0);
+        row.setBackground(Ui.press(liveRow ? Ui.wash() : beside ? Ui.tile() : 0, 8));
+        Ui.Letter icon = new Ui.Letter(this);
+        icon.set(t.letter(), t.icon);
+        row.addView(icon, new LinearLayout.LayoutParams(Ui.dp(16), Ui.dp(16)));
+        TextView title = Ui.text(this, t.label(), 14, liveRow ? Ui.ink() : Ui.muted());
+        title.setPadding(Ui.dp(10), 0, Ui.dp(4), 0);
+        row.addView(title, new LinearLayout.LayoutParams(0, -1, 1));
+        if (t.priv) {
+            TextView tag = Ui.text(this, "private", 11, Ui.muted());
+            tag.setPadding(Ui.dp(6), Ui.dp(2), Ui.dp(6), Ui.dp(2));
+            tag.setBackground(Ui.round(Ui.hairline(), 6));
+            LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(-2, -2);
+            tl.rightMargin = Ui.dp(4);
+            row.addView(tag, tl);
+        }
+        if (liveRow) {
+            Ui.Icon x = Ui.icon(this, Ui.Icon.CLOSE, 30);
+            x.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { close(t); } });
+            row.addView(x);
+        }
+        row.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (t != current) select(t); } });
+        row.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { tabMenu(t, v); return true; } });
+        if (!top) swipeToClose(row, t);
+        return row;
+    }
+
+    /** Swipe a tab sideways and it closes. */
+    void swipeToClose(final View row, final Tab t) {
+        row.setOnTouchListener(new View.OnTouchListener() {
+            float sx, sy;
+            boolean drag;
+            public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        sx = e.getRawX(); sy = e.getRawY(); drag = false; return false;
+                    case MotionEvent.ACTION_MOVE: {
+                        float dx = e.getRawX() - sx, dy = e.getRawY() - sy;
+                        if (!drag && Math.abs(dx) > Ui.dp(14) && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                            drag = true;
+                            v.getParent().requestDisallowInterceptTouchEvent(true);
+                            v.cancelLongPress();
+                            v.setPressed(false);
+                        }
+                        if (drag) {
+                            v.setTranslationX(dx);
+                            v.setAlpha(Math.max(0.15f, 1 - Math.abs(dx) / Math.max(1f, v.getWidth())));
+                            return true;
+                        }
+                        return false;
+                    }
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL: {
+                        if (!drag) return false;
+                        float dx = e.getRawX() - sx;
+                        drag = false;
+                        if (e.getActionMasked() == MotionEvent.ACTION_UP && Math.abs(dx) > v.getWidth() * 0.35f) {
+                            v.animate().translationX(Math.signum(dx) * v.getWidth()).alpha(0).setDuration(140)
+                                .withEndAction(new Runnable() { public void run() { close(t); } });
+                        } else {
+                            v.animate().translationX(0).alpha(1).setDuration(140);
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            }
+        });
+    }
+
+    View pinTile(final Tab t) {
+        FrameLayout tile = new FrameLayout(this);
+        tile.setBackground(Ui.press(t == current ? Ui.wash() : Ui.tile(), 9));
+        Ui.Letter icon = new Ui.Letter(this);
+        icon.set(t.letter(), t.icon);
+        tile.addView(icon, new FrameLayout.LayoutParams(Ui.dp(16), Ui.dp(16), Gravity.CENTER));
+        tile.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (t != current) select(t); } });
+        tile.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { tabMenu(t, v); return true; } });
+        return tile;
+    }
+
+    void refreshChrome() {
+        String u = current == null ? null : current.url;
+        if (u == null) {
+            field.setText(current != null && current.priv ? "Private · search or enter address" : "Search or enter address");
+            field.setTextColor(Ui.faint());
+        } else {
+            String h = current.host == null ? Store.bare(u) : current.host;
+            if (h.startsWith("www.")) h = h.substring(4);
+            field.setText(current.reading ? h + "  ·  reading" : current.priv ? h + "  ·  private" : h);
+            field.setTextColor(Ui.muted());
+        }
+        WebView wv = live();
+        back.setEnabled(wv != null && (wv.canGoBack() || (current.opener != null && tabs.contains(current.opener))));
+        forward.setEnabled(wv != null && wv.canGoForward());
+        reload.setEnabled(wv != null);
+        reload.set(current != null && current.progress < 100 ? Ui.Icon.STOP : Ui.Icon.RELOAD);
+        back.invalidate(); forward.invalidate();
+    }
+
+    void setProgress(Tab t, int p) {
+        t.progress = p;
+        if (t != current) return;
+        if (p >= 100) {
+            progress.animate().alpha(0).setDuration(250).withEndAction(new Runnable() { public void run() { progress.setVisibility(View.GONE); } });
+        } else {
+            progress.animate().cancel();
+            progress.setAlpha(1);
+            progress.setVisibility(View.VISIBLE);
+            progress.bringToFront();
+            progress.setScaleX(Math.max(0.05f, p / 100f));
+        }
+        reload.set(p < 100 ? Ui.Icon.STOP : Ui.Icon.RELOAD);
+    }
+
+    // ── the one field ───────────────────────────────────────────
+
+    void openField() {
+        String start = current != null && current.url != null ? current.url : "";
+        final EditText in = input(current != null && current.priv ? "Private · search or enter address" : "Search or enter address", 17);
+        in.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        in.setImeOptions(EditorInfo.IME_ACTION_GO);
+        in.setText(start);
+        in.selectAll();
+        in.setPadding(Ui.dp(18), 0, Ui.dp(18), 0);
+
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+
+        sheet(in, Ui.dp(56), list, 0.14f);
+        final boolean[] deleting = {false}, inside = {false};
+
+        in.addTextChangedListener(new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int st, int c, int a) { deleting[0] = a < c; }
+            public void onTextChanged(CharSequence s, int st, int b, int c) {}
+            public void afterTextChanged(Editable s) {
+                if (inside[0]) return;
+                String typed = s.toString();
+                int selStart = in.getSelectionStart();
+                if (!deleting[0] && selStart == typed.length()) {
+                    String done = store.complete(typed);
+                    if (done != null && done.length() > typed.length() && done.toLowerCase().startsWith(typed.toLowerCase())) {
+                        inside[0] = true;
+                        s.append(done.substring(typed.length()));
+                        in.setSelection(typed.length(), s.length());
+                        inside[0] = false;
+                    }
+                }
+                String head = typed.substring(0, Math.min(typed.length(), Math.max(0, in.getSelectionStart())));
+                suggestions(list, head, s.toString());
+                remoteSuggestions(in, list, head);
+            }
+        });
+        in.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            public boolean onEditorAction(TextView v, int a, KeyEvent e) {
+                go(in.getText().toString());
+                dismissOverlay();
+                return true;
+            }
+        });
+        suggestions(list, "", "");
+        in.requestFocus();
+        keyboard(in, true);
+    }
+
+    void suggestions(final LinearLayout list, String typed, final String full) {
+        list.removeAllViews();
+        String q = full.trim();
+        if (q.isEmpty()) {
+            if (current != null && current.priv) return;
+            int n = 0;
+            for (final Store.Entry e : store.history) {
+                if (n++ >= 6) break;
+                list.addView(suggestionRow(e.title, Store.bare(e.url), e.url));
+            }
+            return;
+        }
+        boolean url = looksLikeUrl(q);
+        list.addView(suggestionRow(q, url ? "Go to address" : "Search " + Store.ENGINES[store.engine()][0], url ? fix(q) : store.searchUrl(q)));
+        String key = typed.trim().isEmpty() ? q : typed.trim();
+        for (Store.Entry e : store.suggest(key, 7)) list.addView(suggestionRow(e.title, Store.bare(e.url), e.url));
+    }
+
+    /** Only when turned on in Settings: what you type then goes to your search engine as you type it. */
+    final Object typedLock = new Object();
+    volatile String typedNow = "";
+
+    void remoteSuggestions(final EditText in, final LinearLayout list, final String typed) {
+        final String q = typed.trim();
+        typedNow = q;
+        if (!store.flag("suggest", false) || q.length() < 2 || looksLikeUrl(q) || (current != null && current.priv)) return;
+        final String url = store.suggestUrl(q);
+        if (url == null) return;
+        final FrameLayout mine = overlay;
+        final String ua = mobileUA;
+        net.execute(new Runnable() { public void run() {
+            final List<String> got = new ArrayList<>();
+            try {
+                Thread.sleep(150);
+                if (!q.equals(typedNow)) return;     // typing went on: only ask for the latest
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                c.setConnectTimeout(4000); c.setReadTimeout(4000);
+                if (ua != null) c.setRequestProperty("User-Agent", ua);
+                try {
+                    InputStream s = c.getInputStream();
+                    java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[4096]; int n;
+                    while ((n = s.read(buf)) > 0) b.write(buf, 0, n);
+                    JSONArray a = new JSONArray(b.toString("UTF-8")).getJSONArray(1);
+                    for (int i = 0; i < a.length() && got.size() < 5; i++) {
+                        String sug = a.optString(i);
+                        if (!sug.isEmpty() && !sug.equalsIgnoreCase(q)) got.add(sug);
+                    }
+                } finally { c.disconnect(); }
+            } catch (Exception ignored) { return; }
+            ui.post(new Runnable() { public void run() {
+                if (overlay != mine || overlay == null || !q.equals(typedNow)) return;
+                int at = Math.min(1, list.getChildCount());
+                for (String s : got) list.addView(suggestionRow(s, "Search " + Store.ENGINES[store.engine()][0], store.searchUrl(s)), at++);
+            } });
+        } });
+    }
+
+    View suggestionRow(String title, String sub, final String target) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Ui.dp(18), 0, Ui.dp(18), 0);
+        row.setBackground(Ui.press(0, 0));
+        TextView a = Ui.text(this, title == null || title.isEmpty() ? sub : title, 15, Ui.ink());
+        TextView b = Ui.text(this, sub, 12.5f, Ui.muted());
+        b.setPadding(0, Ui.dp(4), 0, 0);
+        row.addView(a); row.addView(b);
+        row.setLayoutParams(new LinearLayout.LayoutParams(-1, Ui.dp(54)));
+        row.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { dismissOverlay(); load(target); } });
+        return row;
+    }
+
+    static final Pattern HOSTLIKE = Pattern.compile("^([a-z0-9-]+\\.)+[a-z]{2,}(:\\d+)?(/.*)?$|^localhost(:\\d+)?(/.*)?$|^\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?(/.*)?$", Pattern.CASE_INSENSITIVE);
+
+    static boolean looksLikeUrl(String s) {
+        s = s.trim();
+        if (s.contains(" ")) return false;
+        if (s.matches("(?i)^(https?|file|about|data|view-source):.*")) return true;
+        return HOSTLIKE.matcher(s).matches();
+    }
+
+    static String fix(String s) {
+        s = s.trim();
+        if (s.matches("(?i)^[a-z][a-z0-9+.-]*:.*") && !s.matches("(?i)^[a-z0-9.-]+:\\d+.*")) return s;
+        return "https://" + s;
+    }
+
+    void go(String text) {
+        String q = text.trim();
+        if (q.isEmpty()) return;
+        load(looksLikeUrl(q) ? fix(q) : store.searchUrl(q));
+    }
+
+    // ── overlays: the field, lists, the tab switcher, settings ──
+
+    /** A card over a quiet scrim, near the top of the page. */
+    LinearLayout sheet(View head, int headHeight, View content, float top) {
+        dismissOverlay();
+        overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(Ui.scrim());
+        overlay.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { dismissOverlay(); } });
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(Ui.card());
+        card.setElevation(Ui.dp(12));
+        card.setClickable(true);
+        card.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+        card.setClipToOutline(true);
+        if (head != null) card.addView(head, new LinearLayout.LayoutParams(-1, headHeight));
+        if (head != null && content != null) {
+            View hair = new View(this);
+            hair.setBackgroundColor(Ui.hairline());
+            card.addView(hair, new LinearLayout.LayoutParams(-1, Math.max(1, Ui.dp(0.5f))));
+        }
+        if (content != null) {
+            ScrollView sc = new ScrollView(this);
+            sc.setVerticalScrollBarEnabled(false);
+            sc.addView(content);
+            card.addView(sc, new LinearLayout.LayoutParams(-1, -2));
+        }
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        int sh = getResources().getDisplayMetrics().heightPixels;
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Math.min(Ui.dp(620), sw - Ui.dp(32)), -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        lp.topMargin = (int) (sh * top);
+        lp.bottomMargin = Ui.dp(24);
+        overlay.addView(card, lp);
+        root.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        overlay.setAlpha(0);
+        overlay.animate().alpha(1).setDuration(120);
+        return card;
+    }
+
+    void dismissOverlay() {
+        if (overlay == null) return;
+        View f = getCurrentFocus();
+        if (f != null) keyboard(f, false);
+        root.removeView(overlay);
+        overlay = null;
+    }
+
+    interface Pick { void pick(Store.Entry e); }
+
+    void listPanel(final String title, final List<Store.Entry> source, final Pick longPick) {
+        final EditText in = input("Search " + title.toLowerCase(), 16);
+        in.setPadding(Ui.dp(18), 0, Ui.dp(18), 0);
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        sheet(in, Ui.dp(54), list, 0.08f);
+        final Runnable fill = new Runnable() { public void run() {
+            list.removeAllViews();
+            String q = in.getText().toString().toLowerCase().trim();
+            int n = 0;
+            for (final Store.Entry e : new ArrayList<>(source)) {
+                if (!q.isEmpty() && !(e.url.toLowerCase().contains(q) || e.title.toLowerCase().contains(q))) continue;
+                if (n++ >= 150) break;
+                View row = suggestionRow(e.title, Store.bare(e.url), e.url);
+                if (longPick != null) row.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) {
+                    longPick.pick(e); run(); return true; } });
+                list.addView(row);
+            }
+            if (n == 0) {
+                TextView none = Ui.text(Main.this, source.isEmpty() ? "No " + title.toLowerCase() + " yet" : "Nothing matches", 14, Ui.muted());
+                none.setPadding(Ui.dp(18), 0, 0, 0);
+                list.addView(none, new LinearLayout.LayoutParams(-1, Ui.dp(54)));
+            }
+        } };
+        in.addTextChangedListener(new Watch() { public void afterTextChanged(Editable s) { fill.run(); } });
+        fill.run();
+    }
+
+    /** Your open tabs by name. With forSplit, the one picked goes beside the page in front. */
+    void switcher(final boolean forSplit) {
+        final EditText in = input(forSplit ? "Put which tab beside this one?" : "Switch to a tab", 16);
+        in.setPadding(Ui.dp(18), 0, Ui.dp(18), 0);
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        sheet(in, Ui.dp(54), list, 0.08f);
+        final Runnable fill = new Runnable() { public void run() {
+            list.removeAllViews();
+            String q = in.getText().toString().toLowerCase().trim();
+            int n = 0;
+            for (final Tab t : new ArrayList<>(tabs)) {
+                if (forSplit && (t == current || t.url == null)) continue;
+                String hay = (t.label() + " " + (t.url == null ? "" : t.url)).toLowerCase();
+                if (!q.isEmpty() && !hay.contains(q)) continue;
+                n++;
+                LinearLayout row = new LinearLayout(Main.this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(Ui.dp(18), 0, Ui.dp(8), 0);
+                row.setBackground(Ui.press(t == current ? Ui.hover() : 0, 0));
+                Ui.Letter icon = new Ui.Letter(Main.this);
+                icon.set(t.letter(), t.icon);
+                row.addView(icon, new LinearLayout.LayoutParams(Ui.dp(18), Ui.dp(18)));
+                LinearLayout texts = new LinearLayout(Main.this);
+                texts.setOrientation(LinearLayout.VERTICAL);
+                texts.setPadding(Ui.dp(14), 0, Ui.dp(8), 0);
+                texts.addView(Ui.text(Main.this, t.label(), 15, Ui.ink()));
+                TextView sub = Ui.text(Main.this, t.url == null ? "New tab" : Store.bare(t.url) + (t.priv ? "  ·  private" : ""), 12.5f, Ui.muted());
+                sub.setPadding(0, Ui.dp(4), 0, 0);
+                texts.addView(sub);
+                row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
+                if (!forSplit) {
+                    Ui.Icon x = Ui.icon(Main.this, Ui.Icon.CLOSE, 36);
+                    final Runnable again = this;
+                    x.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { close(t); again.run(); } });
+                    row.addView(x);
+                }
+                row.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+                    dismissOverlay();
+                    if (forSplit) split(t); else select(t);
+                } });
+                list.addView(row, new LinearLayout.LayoutParams(-1, Ui.dp(56)));
+            }
+            if (forSplit) {
+                list.addView(settingRow("A new page beside this one", "", new View.OnClickListener() { public void onClick(View v) {
+                    dismissOverlay();
+                    Tab t = newTab(null, false);
+                    t.priv = current != null && current.priv;
+                    t.view = makeView(t);
+                    split(t);
+                    focusPane(t);
+                    openField();
+                } }));
+            } else if (n == 0) {
+                TextView none = Ui.text(Main.this, "Nothing matches", 14, Ui.muted());
+                none.setPadding(Ui.dp(18), 0, 0, 0);
+                list.addView(none, new LinearLayout.LayoutParams(-1, Ui.dp(54)));
+            }
+        } };
+        in.addTextChangedListener(new Watch() { public void afterTextChanged(Editable s) { fill.run(); } });
+        in.setImeOptions(EditorInfo.IME_ACTION_GO);
+        in.setOnEditorActionListener(new TextView.OnEditorActionListener() { public boolean onEditorAction(TextView v, int a, KeyEvent e) {
+            if (list.getChildCount() > 0) list.getChildAt(0).performClick();
+            return true;
+        } });
+        fill.run();
+    }
+
+    void settings() {
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(0, Ui.dp(6), 0, Ui.dp(6));
+        TextView head = Ui.text(this, "Settings", 16, Ui.ink());
+        head.setTypeface(Ui.medium());
+        head.setPadding(Ui.dp(18), 0, 0, 0);
+        sheet(head, Ui.dp(54), list, 0.06f);
+
+        final Runnable rebuild = new Runnable() { public void run() { dismissOverlay(); saveSession(); recreate(); } };
+        final String[] looks = {"System", "Light", "Dark"};
+        list.addView(section("Look"));
+        list.addView(settingRow("Appearance", looks[store.look()], new View.OnClickListener() { public void onClick(View v) {
+            Runnable[] acts = new Runnable[3];
+            for (int i = 0; i < 3; i++) {
+                final int k = i;
+                acts[i] = new Runnable() { public void run() { store.look(k); rebuild.run(); } };
+            }
+            popup(v, looks, acts);
+        } }));
+        list.addView(toggleRow("Pure black in dark mode (AMOLED)", "black", false, rebuild));
+        list.addView(toggleRow("Darken bright sites in dark mode", "darken", false, new Runnable() { public void run() {
+            for (Tab t : tabs) if (t.view != null) t.view.reload(); } }));
+        list.addView(settingRow("Tabs", top ? "Across the top" : "Down the left", new View.OnClickListener() { public void onClick(View v) {
+            popup(v, new String[]{"Down the left", "Across the top"}, new Runnable[]{
+                new Runnable() { public void run() { store.set("top", false); rebuild.run(); } },
+                new Runnable() { public void run() { store.set("top", true); rebuild.run(); } } });
+        } }));
+        int w = Math.max(0, Math.min(WALLS.length - 1, store.prefs.getInt("wall", 0)));
+        list.addView(settingRow("New tab background", WALLS[w], new View.OnClickListener() { public void onClick(View v) {
+            Runnable[] acts = new Runnable[WALLS.length];
+            for (int i = 0; i < WALLS.length; i++) {
+                final int k = i;
+                acts[i] = new Runnable() { public void run() {
+                    if (k == WALLS.length - 1) {
+                        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        pick.addCategory(Intent.CATEGORY_OPENABLE);
+                        pick.setType("image/*");
+                        try { startActivityForResult(pick, WALL); } catch (Exception e) { toast("No photo picker on this tablet"); }
+                        return;
+                    }
+                    store.prefs.edit().putInt("wall", k).apply();
+                    wallpaper(); settings();
+                } };
+            }
+            popup(v, WALLS, acts);
+        } }));
+
+        list.addView(section("Searching"));
+        list.addView(settingRow("Search with", Store.ENGINES[store.engine()][0], new View.OnClickListener() { public void onClick(View v) {
+            String[] names = new String[Store.ENGINES.length];
+            Runnable[] acts = new Runnable[names.length];
+            for (int i = 0; i < names.length; i++) {
+                final int k = i;
+                names[i] = Store.ENGINES[i][0];
+                acts[i] = new Runnable() { public void run() { store.engine(k); settings(); } };
+            }
+            popup(v, names, acts);
+        } }));
+        list.addView(toggleRow("Suggestions as you type (sends it to " + Store.ENGINES[store.engine()][0] + ")", "suggest", false, null));
+
+        list.addView(section("Privacy and blocking"));
+        list.addView(toggleRow("Block ads and trackers", "shield", true, new Runnable() { public void run() { shieldOn = store.flag("shield", true); } }));
+        list.addView(toggleRow("Stronger blocking with EasyList", "easylist", false, new Runnable() { public void run() {
+            if (store.flag("easylist", false)) loadLists(true);
+            else Shield.extra = new HashSet<>();
+        } }));
+        list.addView(toggleRow("Keep a history", "history", true, null));
+        list.addView(toggleRow("Bring back tabs from last time", "restore", true, null));
+        list.addView(toggleRow("Ask sites for their desktop version", "desktop", false, null));
+        list.addView(settingRow("Clear history", "", new View.OnClickListener() { public void onClick(View v) {
+            store.clearHistory(); toast("History cleared"); } }));
+        list.addView(settingRow("Clear cookies and site data", "", new View.OnClickListener() { public void onClick(View v) {
+            CookieManager.getInstance().removeAllCookies(null);
+            WebStorage.getInstance().deleteAllData();
+            for (Tab t : tabs) if (t.view != null) t.view.clearCache(true);
+            toast("Cookies and site data cleared"); } }));
+        list.addView(settingRow("Hidden elements", "Bring back everywhere", new View.OnClickListener() { public void onClick(View v) {
+            store.clearHidden(); toast("Everything hidden is back"); } }));
+
+        list.addView(section("Bookmarks"));
+        list.addView(settingRow("Import bookmarks", "From an HTML file", new View.OnClickListener() { public void onClick(View v) {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            try { startActivityForResult(i, IMPORT); } catch (Exception e) { toast("No file picker on this tablet"); }
+        } }));
+        list.addView(settingRow("Export bookmarks", store.bookmarks.size() + " saved", new View.OnClickListener() { public void onClick(View v) {
+            Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("text/html");
+            i.putExtra(Intent.EXTRA_TITLE, "Seek bookmarks.html");
+            try { startActivityForResult(i, EXPORT); } catch (Exception e) { toast("No file picker on this tablet"); }
+        } }));
+
+        list.addView(gap());
+        TextView about = Ui.text(this, "Seek 1.1 · a quiet browser after Search by Office Commun. No account, no telemetry; everything stays on this tablet."
+            + "\n\nSwipe two fingers right to go back, left to go forward. Pull a page down from the top to reload. Swipe a tab sideways to close it. Hold New tab for a private one.", 12.5f, Ui.muted());
+        about.setSingleLine(false);
+        about.setPadding(Ui.dp(18), Ui.dp(8), Ui.dp(18), Ui.dp(10));
+        list.addView(about);
+    }
+
+    View section(String name) {
+        TextView t = Ui.text(this, name.toUpperCase(), 11, Ui.muted());
+        t.setLetterSpacing(0.08f);
+        t.setPadding(Ui.dp(18), Ui.dp(14), 0, Ui.dp(4));
+        return t;
+    }
+
+    View gap() {
+        View v = new View(this);
+        v.setBackgroundColor(Ui.hairline());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, Math.max(1, Ui.dp(0.5f)));
+        lp.setMargins(Ui.dp(18), Ui.dp(6), Ui.dp(18), Ui.dp(6));
+        v.setLayoutParams(lp);
+        return v;
+    }
+
+    View settingRow(String label, String value, View.OnClickListener click) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Ui.dp(18), 0, Ui.dp(18), 0);
+        row.setBackground(Ui.press(0, 0));
+        row.addView(Ui.text(this, label, 15, Ui.ink()), new LinearLayout.LayoutParams(0, -1, 1));
+        row.addView(Ui.text(this, value, 14, Ui.muted()), new LinearLayout.LayoutParams(-2, -1));
+        row.setOnClickListener(click);
+        row.setLayoutParams(new LinearLayout.LayoutParams(-1, Ui.dp(48)));
+        return row;
+    }
+
+    View toggleRow(String label, final String key, final boolean def, final Runnable after) {
+        final View row = settingRow(label, store.flag(key, def) ? "On" : "Off", null);
+        row.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+            boolean now = !store.flag(key, def);
+            store.set(key, now);
+            ((TextView) ((LinearLayout) row).getChildAt(1)).setText(now ? "On" : "Off");
+            if (after != null) after.run();
+        } });
+        return row;
+    }
+
+    // ── EasyList ────────────────────────────────────────────────
+
+    void loadLists(final boolean announce) {
+        final File f = new File(getFilesDir(), "easylist.txt");
+        net.execute(new Runnable() { public void run() {
+            Shield.loadSaved(f);
+            boolean stale = !f.exists() || System.currentTimeMillis() - f.lastModified() > 7L * 24 * 3600 * 1000;
+            if (!stale) {
+                if (announce) {
+                    final int n = Shield.extra.size();
+                    ui.post(new Runnable() { public void run() { toast("Blocking " + n + " more ad and tracker sites"); } });
+                }
+                return;
+            }
+            if (announce) ui.post(new Runnable() { public void run() { toast("Downloading EasyList…"); } });
+            try {
+                final int n = Shield.download(f);
+                if (announce) ui.post(new Runnable() { public void run() { toast("Blocking " + n + " more ad and tracker sites"); } });
+            } catch (Exception e) {
+                if (announce) ui.post(new Runnable() { public void run() { toast("Couldn't download EasyList. It will try again next launch"); } });
+            }
+        } });
+    }
+
+    // ── menus ───────────────────────────────────────────────────
+
+    void popup(View anchor, String[] labels, final Runnable[] acts) {
+        int[] at = new int[2];
+        anchor.getLocationInWindow(at);
+        popupAt(at[0] + Ui.dp(8), at[1] + anchor.getHeight() / 2, labels, acts);
+    }
+
+    void popupAt(int x, int y, String[] labels, final Runnable[] acts) {
+        if (menu != null) menu.dismiss();
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(0, Ui.dp(6), 0, Ui.dp(6));
+        for (int i = 0; i < labels.length; i++) {
+            if (labels[i] == null) { box.addView(gap()); continue; }
+            final int k = i;
+            TextView t = Ui.text(this, labels[i], 15, Ui.ink());
+            t.setPadding(Ui.dp(16), 0, Ui.dp(24), 0);
+            t.setBackground(Ui.press(0, 0));
+            t.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+                if (menu != null) menu.dismiss();
+                if (acts[k] != null) acts[k].run();
+            } });
+            box.addView(t, new LinearLayout.LayoutParams(-1, Ui.dp(42)));
+        }
+        ScrollView sc = new ScrollView(this);
+        sc.setVerticalScrollBarEnabled(false);
+        sc.setBackground(Ui.card());
+        sc.addView(box);
+        box.measure(View.MeasureSpec.makeMeasureSpec(Ui.dp(340), View.MeasureSpec.AT_MOST), View.MeasureSpec.UNSPECIFIED);
+        int sw = root.getWidth(), sh = root.getHeight();
+        int w = Math.max(Ui.dp(210), box.getMeasuredWidth()), h = Math.min(box.getMeasuredHeight(), sh - Ui.dp(16));
+        menu = new PopupWindow(sc, w, h, true);
+        menu.setElevation(Ui.dp(10));
+        menu.setOutsideTouchable(true);
+        menu.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0));
+        int[] r = new int[2];
+        root.getLocationInWindow(r);
+        x = Math.max(r[0] + Ui.dp(8), Math.min(x, r[0] + sw - w - Ui.dp(8)));
+        y = Math.max(r[1] + Ui.dp(8), Math.min(y, r[1] + sh - h - Ui.dp(8)));
+        menu.showAtLocation(root, Gravity.TOP | Gravity.LEFT, x, y);
+    }
+
+    void tabMenu(final Tab t, View v) {
+        List<String> l = new ArrayList<>();
+        List<Runnable> a = new ArrayList<>();
+        if (!t.priv) {
+            l.add(t.pinned ? "Unpin" : "Pin"); a.add(new Runnable() { public void run() {
+                t.pinned = !t.pinned;
+                tabs.remove(t);
+                int i = 0;
+                while (i < tabs.size() && tabs.get(i).pinned) i++;
+                tabs.add(i, t);
+                refreshTabs(); saveSoon(); } });
+        }
+        if (t != current && t.url != null) { l.add("Open beside this page"); a.add(new Runnable() { public void run() { split(t); } }); }
+        l.add("Duplicate"); a.add(new Runnable() { public void run() {
+            if (t.url == null) return;
+            Tab d = newTab(null, false); d.url = t.url; d.host = t.host; d.title = t.title; d.priv = t.priv; select(d); } });
+        l.add("Copy address"); a.add(new Runnable() { public void run() { copy(t.url); } });
+        l.add(null); a.add(null);
+        l.add("Close tab"); a.add(new Runnable() { public void run() { close(t); } });
+        l.add("Close other tabs"); a.add(new Runnable() { public void run() {
+            for (Tab o : new ArrayList<>(tabs)) if (o != t && !o.pinned) close(o);
+            select(t); } });
+        popup(v, l.toArray(new String[0]), a.toArray(new Runnable[0]));
+    }
+
+    void pageMenu(final View v) {
+        final Tab t = current;
+        final boolean hasPage = t != null && t.view != null && t.url != null;
+        List<String> l = new ArrayList<>();
+        List<Runnable> a = new ArrayList<>();
+        if (hasPage) {
+            l.add("Find on page"); a.add(new Runnable() { public void run() { openFind(); } });
+            if (t.reading) { l.add("Leave reading mode"); a.add(new Runnable() { public void run() { t.reading = false; t.view.reload(); refreshChrome(); } }); }
+            else { l.add("Reading mode"); a.add(new Runnable() { public void run() { t.readerAsked = true; t.view.evaluateJavascript(Scripts.reader(Ui.black), null); } }); }
+            l.add("Hide something"); a.add(new Runnable() { public void run() { startPicking(); } });
+            int n = store.hiddenOn(t.host).size();
+            if (n > 0) { l.add("Show what is hidden here (" + n + ")"); a.add(new Runnable() { public void run() {
+                store.unhideAll(t.host); t.view.reload(); } }); }
+            if (Build.VERSION.SDK_INT >= 26) { l.add("Float the video"); a.add(new Runnable() { public void run() { floatVideo(); } }); }
+            l.add("Text size (" + store.zoom(t.host) + "%)"); a.add(new Runnable() { public void run() { textSize(v, t); } });
+            l.add(right != null ? "One page again" : "Split with another tab"); a.add(new Runnable() { public void run() {
+                if (right != null) endSplit(); else switcher(true); } });
+            l.add("This site…"); a.add(new Runnable() { public void run() { siteMenu(v, t); } });
+            l.add(null); a.add(null);
+            l.add(store.isBookmarked(t.url) ? "Remove bookmark" : "Bookmark this page"); a.add(new Runnable() { public void run() {
+                toast(store.toggleBookmark(t.url, t.title) ? "Bookmarked" : "Bookmark removed"); } });
+            l.add("Share"); a.add(new Runnable() { public void run() { share(t.url, t.title); } });
+            l.add("Copy address"); a.add(new Runnable() { public void run() { copy(t.url); } });
+            l.add(null); a.add(null);
+        }
+        l.add("Tabs"); a.add(new Runnable() { public void run() { switcher(false); } });
+        l.add("New private tab"); a.add(new Runnable() { public void run() { newPrivateTab(); } });
+        l.add("Bookmarks"); a.add(new Runnable() { public void run() { listPanel("Bookmarks", store.bookmarks, new Pick() { public void pick(Store.Entry e) {
+            store.removeBookmark(e); toast("Bookmark removed"); } }); } });
+        l.add("History"); a.add(new Runnable() { public void run() { listPanel("History", store.history, null); } });
+        l.add("Downloads"); a.add(new Runnable() { public void run() {
+            try { startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)); } catch (Exception e) { toast("No downloads app on this tablet"); } } });
+        if (!closed.isEmpty()) { l.add("Reopen closed tab"); a.add(new Runnable() { public void run() { reopen(); } }); }
+        l.add("Settings"); a.add(new Runnable() { public void run() { settings(); } });
+        int[] at = new int[2];
+        v.getLocationInWindow(at);
+        String[] labels = l.toArray(new String[0]);
+        popupAt(at[0], top ? at[1] + v.getHeight() : at[1] - Ui.dp(42) * labels.length, labels, a.toArray(new Runnable[0]));
+    }
+
+    void siteMenu(View v, final Tab t) {
+        final String host = t.host;
+        boolean p = host != null && paused.contains(host);
+        boolean aw = host != null && awake.contains(host);
+        List<String> l = new ArrayList<>();
+        List<Runnable> a = new ArrayList<>();
+        if (shieldOn && host != null) { l.add(p ? "Block ads on this site" : "Allow ads on this site"); a.add(new Runnable() { public void run() {
+            store.pause(host, !paused.contains(host)); paused = store.paused(); t.view.reload(); } }); }
+        if (host != null) { l.add(aw ? "Let this site sleep" : "Keep this site awake"); a.add(new Runnable() { public void run() {
+            boolean on = !awake.contains(host);
+            store.awake(host, on); awake = store.awake();
+            toast(on ? "This site stays loaded in the background, at the cost of memory" : "This site can sleep again"); } }); }
+        l.add(t.desktop ? "Mobile site" : "Desktop site"); a.add(new Runnable() { public void run() {
+            t.desktop = !t.desktop; t.view.getSettings().setUserAgentString(t.desktop ? desktopUA : mobileUA); t.view.reload(); } });
+        popup(v, l.toArray(new String[0]), a.toArray(new Runnable[0]));
+    }
+
+    static final int[] SIZES = {80, 90, 100, 110, 125, 150, 175};
+
+    void textSize(View v, final Tab t) {
+        String[] l = new String[SIZES.length];
+        Runnable[] a = new Runnable[SIZES.length];
+        for (int i = 0; i < SIZES.length; i++) {
+            final int pct = SIZES[i];
+            l[i] = pct + "%" + (pct == store.zoom(t.host) ? "  ✓" : "");
+            a[i] = new Runnable() { public void run() { setZoom(t, pct); } };
+        }
+        popup(v, l, a);
+    }
+
+    void setZoom(Tab t, int pct) {
+        store.zoom(t.host, pct);
+        for (Tab o : tabs) if (o.view != null && o.host != null && o.host.equals(t.host)) o.view.getSettings().setTextZoom(pct);
+    }
+
+    void stepZoom(int dir) {
+        if (current == null || current.view == null) return;
+        int z = store.zoom(current.host), i = 0;
+        while (i < SIZES.length - 1 && SIZES[i] < z) i++;
+        i = Math.max(0, Math.min(SIZES.length - 1, i + dir));
+        setZoom(current, SIZES[i]);
+        toast("Text " + SIZES[i] + "%");
+    }
+
+    void linkMenu(final String link, final String image) {
+        List<String> l = new ArrayList<>();
+        List<Runnable> a = new ArrayList<>();
+        final boolean priv = current != null && current.priv;
+        if (link != null) {
+            l.add("Open in new tab"); a.add(new Runnable() { public void run() { Tab t = newTab(null, false); t.url = link; t.host = Tab.hostOf(link); t.opener = current; t.priv = priv; refreshTabs(); saveSoon(); } });
+            l.add("Open in new tab and go"); a.add(new Runnable() { public void run() { Tab o = current; Tab t = newTab(null, false); t.url = link; t.host = Tab.hostOf(link); t.opener = o; t.priv = priv; select(t); } });
+            l.add("Open beside this page"); a.add(new Runnable() { public void run() { Tab t = newTab(null, false); t.url = link; t.host = Tab.hostOf(link); t.priv = priv; split(t); } });
+            if (!priv) { l.add("Open in private tab"); a.add(new Runnable() { public void run() { Tab t = newTab(null, false); t.url = link; t.host = Tab.hostOf(link); t.priv = true; select(t); } }); }
+            l.add("Copy link"); a.add(new Runnable() { public void run() { copy(link); } });
+            l.add("Share link"); a.add(new Runnable() { public void run() { share(link, null); } });
+        }
+        if (image != null && (image.startsWith("http") || image.startsWith("data:"))) {
+            if (!l.isEmpty()) { l.add(null); a.add(null); }
+            l.add("Open image in new tab"); a.add(new Runnable() { public void run() { Tab t = newTab(null, false); t.url = image; t.host = Tab.hostOf(image); t.priv = priv; refreshTabs(); } });
+            if (image.startsWith("http")) { l.add("Save image"); a.add(new Runnable() { public void run() { download(image, null, null, null); } }); }
+        }
+        if (l.isEmpty()) return;
+        popupAt((int) touchX, (int) touchY, l.toArray(new String[0]), a.toArray(new Runnable[0]));
+    }
+
+    // ── floating video ──────────────────────────────────────────
+
+    void floatVideo() {
+        if (Build.VERSION.SDK_INT < 26 || live() == null) return;
+        final WebView wv = live();
+        wv.evaluateJavascript(Scripts.FLOAT, new ValueCallback<String>() { public void onReceiveValue(String r) {
+            if (!"true".equals(r)) { toast("No video on this page"); return; }
+            floating = true;
+            if (!enterPip()) {
+                floating = false;
+                wv.evaluateJavascript(Scripts.UNFLOAT, null);
+                toast("Floating windows are turned off for Seek in this tablet's settings");
+            }
+        } });
+    }
+
+    boolean enterPip() {
+        if (Build.VERSION.SDK_INT < 26) return false;
+        try {
+            return enterPictureInPictureMode(new PictureInPictureParams.Builder().setAspectRatio(new Rational(16, 9)).build());
+        } catch (Exception e) { return false; }
+    }
+
+    @Override protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        if (fullscreen != null) enterPip();   // a full-screen video keeps playing in a small window
+    }
+
+    @Override public void onPictureInPictureModeChanged(boolean in, Configuration c) {
+        super.onPictureInPictureModeChanged(in, c);
+        pip = in;
+        if (in) {
+            dismissOverlay();
+            if (menu != null) menu.dismiss();
+            if (findBar.getVisibility() == View.VISIBLE) closeFind();
+            if (right != null) {    // only the page with the video, while it floats
+                (current == left ? paneB : paneA).setVisibility(View.GONE);
+                divider.setVisibility(View.GONE);
+            }
+        } else {
+            if (floating) for (Tab t : front()) if (t.view != null) t.view.evaluateJavascript(Scripts.UNFLOAT, null);
+            floating = false;
+            if (right != null) { paneA.setVisibility(View.VISIBLE); paneB.setVisibility(View.VISIBLE); divider.setVisibility(View.VISIBLE); }
+        }
+        fold(folded);
+    }
+
+    // ── the web view ────────────────────────────────────────────
+
+    final class Bridge {
+        final Tab tab;
+        Bridge(Tab t) { tab = t; }
+        @JavascriptInterface public void hide(final String selector) {
+            ui.post(new Runnable() { public void run() {
+                if (!picking || tab != current) return;
+                store.hide(tab.host, selector);
+            } });
+        }
+        @JavascriptInterface public void reader(final boolean ok) {
+            ui.post(new Runnable() { public void run() {
+                if (!tab.readerAsked) return;
+                tab.readerAsked = false;
+                tab.reading = ok;
+                if (!ok) toast("Nothing here to read");
+                if (tab == current) refreshChrome();
+            } });
+        }
+    }
+
+    final SeekView.Pull pull = new SeekView.Pull() {
+        public void pulling(SeekView v, float d) {
+            if (v != live() || picking) return;
+            pullDot.animate().cancel();
+            pullDot.setVisibility(View.VISIBLE);
+            pullDot.bringToFront();
+            float travel = Math.min(d * 0.5f, Ui.dp(80));
+            pullDot.setTranslationY(travel - Ui.dp(10));
+            pullDot.setRotation(d * 1.2f);
+            pullDot.setAlpha(Math.min(1f, d / Ui.dp(110)));
+            pullDot.tint(d > Ui.dp(110) ? Ui.ink() : Ui.muted());
+            View pane = (View) v.getParent();
+            if (right != null && pane != null) {
+                int[] a = new int[2], p = new int[2];
+                pane.getLocationInWindow(a);
+                page.getLocationInWindow(p);
+                pullDot.setTranslationX(a[0] - p[0] + pane.getWidth() / 2f - page.getWidth() / 2f);
+            } else pullDot.setTranslationX(0);
+        }
+        public void released(SeekView v, boolean go) {
+            if (pullDot.getVisibility() != View.VISIBLE) return;
+            pullDot.animate().alpha(0).translationY(-Ui.dp(20)).setDuration(180).withEndAction(new Runnable() { public void run() { pullDot.setVisibility(View.GONE); } });
+            if (go && !picking) v.reload();
+        }
+    };
+
+    WebView makeView(final Tab t) {
+        final SeekView v = new SeekView(this);
+        v.pull = pull;
+        v.setBackgroundColor(Ui.ground());
+        WebSettings s = v.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setDatabaseEnabled(true);
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(false);
+        s.setBuiltInZoomControls(true);
+        s.setDisplayZoomControls(false);
+        s.setUseWideViewPort(true);
+        s.setLoadWithOverviewMode(true);
+        s.setMediaPlaybackRequiresUserGesture(true);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        s.setAllowFileAccess(false);
+        s.setAllowContentAccess(false);
+        s.setGeolocationEnabled(false);
+        s.setSaveFormData(!t.priv);
+        s.setTextZoom(store.zoom(t.host));
+        if (mobileUA == null) userAgents(s.getUserAgentString());
+        t.desktop = t.desktop || store.flag("desktop", false);
+        s.setUserAgentString(t.desktop ? desktopUA : mobileUA);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(v, true);
+        v.addJavascriptInterface(new Bridge(t), "SeekBridge");
+        v.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+
+        v.setOnTouchListener(new View.OnTouchListener() { public boolean onTouch(View view, MotionEvent e) {
+            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) focusPane(t);
+            touchX = e.getRawX(); touchY = e.getRawY(); return false; } });
+        v.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View view) {
+            if (picking) return true;
+            WebView.HitTestResult h = v.getHitTestResult();
+            int type = h.getType();
+            final String extra = h.getExtra();
+            if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE) { linkMenu(extra, null); return true; }
+            if (type == WebView.HitTestResult.IMAGE_TYPE) { linkMenu(null, extra); return true; }
+            if (type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                Message m = new Handler(Looper.getMainLooper()) {
+                    @Override public void handleMessage(Message msg) {
+                        String href = msg.getData().getString("url");
+                        linkMenu(href != null && !href.isEmpty() ? href : null, extra);
+                    }
+                }.obtainMessage();
+                v.requestFocusNodeHref(m);
+                return true;
+            }
+            return false;
+        } });
+
+        v.setDownloadListener(new android.webkit.DownloadListener() {
+            public void onDownloadStart(String url, String ua, String disposition, String mime, long length) {
+                download(url, ua, disposition, mime);
+            }
+        });
+
+        v.setFindListener(new WebView.FindListener() {
+            public void onFindResultReceived(int at, int count, boolean done) {
+                if (t != current) return;
+                findCount.setText(count == 0 ? (findInput.length() == 0 ? "" : "None") : (at + 1) + " of " + count);
+            }
+        });
+
+        v.setWebViewClient(new WebViewClient() {
+            @Override public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return external(url);
+            }
+
+            @Override public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                String before = t.host;
+                t.url = url;
+                t.host = Tab.hostOf(url);
+                t.reading = false;
+                if (favicon != null) t.icon = favicon;
+                if (t.host != null && !t.host.equals(before)) view.getSettings().setTextZoom(store.zoom(t.host));
+                setProgress(t, 5);
+                if (t == current) refreshChrome();
+            }
+
+            @Override public void onPageCommitVisible(WebView view, String url) { curtain(t); }
+
+            @Override public void onPageFinished(WebView view, String url) {
+                curtain(t);
+                if (picking && t == current) view.evaluateJavascript(Scripts.PICK, null);
+                setProgress(t, 100);
+                if (!t.priv && store.flag("history", true)) store.visit(url, view.getTitle());
+                if (t == current) refreshChrome();
+                saveSoon();
+            }
+
+            @Override public void doUpdateVisitedHistory(WebView view, String url, boolean reload) {
+                if (url == null || url.startsWith("data:") || url.equals("about:blank")) return;
+                t.url = url;
+                t.host = Tab.hostOf(url);
+                if (t == current) refreshChrome();
+            }
+
+            @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                if (!shieldOn || req.isForMainFrame()) return null;
+                String page = t.host;
+                if (page != null && paused.contains(page)) return null;
+                if (Shield.blocked(req.getUrl().toString(), page)) return Shield.empty();
+                return null;
+            }
+        });
+
+        v.setWebChromeClient(new WebChromeClient() {
+            @Override public void onProgressChanged(WebView view, int p) {
+                if (p < 100) setProgress(t, p);
+            }
+
+            @Override public void onReceivedTitle(WebView view, String title) {
+                t.title = title == null ? "" : title;
+                if (!t.priv) store.retitle(view.getUrl(), title);
+                refreshTabsSoon();
+            }
+
+            @Override public void onReceivedIcon(WebView view, Bitmap icon) {
+                t.icon = icon;
+                refreshTabsSoon();
+            }
+
+            @Override public boolean onCreateWindow(WebView view, boolean dialog, boolean gesture, Message result) {
+                if (!gesture) return false;     // popups nobody asked for
+                Tab n = new Tab(null, null, false);
+                n.opener = t;
+                n.priv = t.priv;
+                int at = tabs.indexOf(t);
+                tabs.add(t.pinned ? tabs.size() : at + 1, n);
+                n.view = makeView(n);
+                WebView.WebViewTransport tr = (WebView.WebViewTransport) result.obj;
+                tr.setWebView(n.view);
+                result.sendToTarget();
+                select(n);
+                return true;
+            }
+
+            @Override public void onCloseWindow(WebView window) { close(t); }
+
+            @Override public void onShowCustomView(View view, CustomViewCallback done) {
+                if (fullscreen != null) { done.onCustomViewHidden(); return; }
+                fullscreen = view;
+                fullscreenDone = done;
+                view.setBackgroundColor(0xFF000000);
+                root.addView(view, new FrameLayout.LayoutParams(-1, -1));
+                getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            }
+
+            @Override public void onHideCustomView() { leaveFullscreen(); }
+
+            @Override public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb, FileChooserParams params) {
+                if (filePick != null) filePick.onReceiveValue(null);
+                filePick = cb;
+                try {
+                    startActivityForResult(params.createIntent(), FILE_PICK);
+                } catch (ActivityNotFoundException e) {
+                    filePick = null;
+                    return false;
+                }
+                return true;
+            }
+
+            @Override public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback cb) {
+                cb.invoke(origin, false, false);
+            }
+
+            @Override public void onPermissionRequest(PermissionRequest r) { r.deny(); }
+        });
+        return v;
+    }
+
+    void userAgents(String ua) {
+        String m = ua.replace("; wv", "").replaceAll("Version/\\d+(\\.\\d+)* ", "");
+        boolean tablet = getResources().getConfiguration().smallestScreenWidthDp >= 600;
+        if (tablet) m = m.replace(" Mobile ", " ");
+        mobileUA = m;
+        java.util.regex.Matcher cv = Pattern.compile("Chrome/([\\d.]+)").matcher(ua);
+        String ver = cv.find() ? cv.group(1) : "120.0.0.0";
+        desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + ver + " Safari/537.36";
+    }
+
+    void curtain(Tab t) {
+        if (t.view == null || t.url == null) return;
+        if (Ui.dark && store.flag("darken", false)) t.view.evaluateJavascript(Scripts.DARKEN, null);
+        boolean shield = shieldOn && (t.host == null || !paused.contains(t.host));
+        List<String> hidden = store.hiddenOn(t.host);
+        if (!shield && hidden.isEmpty()) return;
+        t.view.evaluateJavascript(Scripts.curtain(shield, hidden), null);
+    }
+
+    boolean external(String url) {
+        if (url == null) return false;
+        String lower = url.toLowerCase();
+        if (lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("about:")
+            || lower.startsWith("data:") || lower.startsWith("blob:") || lower.startsWith("javascript:")) return false;
+        try {
+            if (lower.startsWith("intent:")) {
+                Intent i = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
+                i.addCategory(Intent.CATEGORY_BROWSABLE);
+                i.setComponent(null);
+                i.setSelector(null);
+                try { startActivity(i); }
+                catch (ActivityNotFoundException e) {
+                    String fallback = i.getStringExtra("browser_fallback_url");
+                    if (fallback != null && (fallback.startsWith("http://") || fallback.startsWith("https://"))) load(fallback);
+                }
+                return true;
+            }
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addCategory(Intent.CATEGORY_BROWSABLE);
+            startActivity(i);
+        } catch (Exception e) {
+            toast("No app here opens that link");
+        }
+        return true;
+    }
+
+    void leaveFullscreen() {
+        if (fullscreen == null) return;
+        root.removeView(fullscreen);
+        fullscreen = null;
+        if (fullscreenDone != null) fullscreenDone.onCustomViewHidden();
+        fullscreenDone = null;
+        bars();
+    }
+
+    @Override protected void onActivityResult(int req, int result, Intent data) {
+        if (req == FILE_PICK) {
+            if (filePick != null) filePick.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result, data));
+            filePick = null;
+            return;
+        }
+        if (result != RESULT_OK || data == null || data.getData() == null) { super.onActivityResult(req, result, data); return; }
+        Uri uri = data.getData();
+        try {
+            if (req == EXPORT) {
+                OutputStream o = getContentResolver().openOutputStream(uri);
+                try { o.write(store.exportBookmarks().getBytes("UTF-8")); } finally { o.close(); }
+                toast("Exported " + store.bookmarks.size() + " bookmarks");
+            } else if (req == IMPORT) {
+                InputStream i = getContentResolver().openInputStream(uri);
+                java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+                try { byte[] buf = new byte[8192]; int n; while ((n = i.read(buf)) > 0) b.write(buf, 0, n); } finally { i.close(); }
+                int n = store.importBookmarks(b.toString("UTF-8"));
+                toast(n == 0 ? "No new bookmarks in that file" : "Imported " + n + " bookmarks");
+            } else if (req == WALL) {
+                saveWall(uri);
+                store.prefs.edit().putInt("wall", WALLS.length - 1).apply();
+                wallpaper();
+                toast("New tab background set");
+            }
+        } catch (Exception e) {
+            toast("That didn't work: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /** The photo, scaled to the screen once and kept, so it costs nothing while browsing. */
+    void saveWall(Uri uri) throws Exception {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        InputStream in = getContentResolver().openInputStream(uri);
+        try { BitmapFactory.decodeStream(in, null, o); } finally { in.close(); }
+        int target = Math.max(getResources().getDisplayMetrics().widthPixels, getResources().getDisplayMetrics().heightPixels);
+        int sample = 1;
+        while (Math.max(o.outWidth, o.outHeight) / (sample * 2) >= target) sample *= 2;
+        BitmapFactory.Options d = new BitmapFactory.Options();
+        d.inSampleSize = sample;
+        in = getContentResolver().openInputStream(uri);
+        Bitmap b;
+        try { b = BitmapFactory.decodeStream(in, null, d); } finally { in.close(); }
+        if (b == null) throw new java.io.IOException("not an image");
+        java.io.FileOutputStream out = new java.io.FileOutputStream(new File(getFilesDir(), "wall.jpg"));
+        try { b.compress(Bitmap.CompressFormat.JPEG, 88, out); } finally { out.close(); }
+    }
+
+    void download(String url, String ua, String disposition, String mime) {
+        if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) {
+            toast("This download can't be saved here");
+            return;
+        }
+        try {
+            String name = URLUtil.guessFileName(url, disposition, mime);
+            DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+            String cookie = CookieManager.getInstance().getCookie(url);
+            if (cookie != null) r.addRequestHeader("Cookie", cookie);
+            r.addRequestHeader("User-Agent", ua != null ? ua : mobileUA != null ? mobileUA : "");
+            if (current != null && current.url != null) r.addRequestHeader("Referer", current.url);
+            if (mime != null) r.setMimeType(mime);
+            r.setTitle(name);
+            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+            ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
+            toast("Downloading " + name);
+        } catch (Exception e) {
+            toast("Couldn't start the download");
+        }
+    }
+
+    // ── going back, gestures, keys ──────────────────────────────
+
+    void goBack() {
+        WebView wv = live();
+        if (wv != null && wv.canGoBack()) { wv.goBack(); return; }
+        if (current != null && current.opener != null && tabs.contains(current.opener)) close(current);
+    }
+
+    void goForward() {
+        WebView wv = live();
+        if (wv != null && wv.canGoForward()) wv.goForward();
+    }
+
+    @Override public void onBackPressed() {
+        if (fullscreen != null) { leaveFullscreen(); return; }
+        if (menu != null && menu.isShowing()) { menu.dismiss(); return; }
+        if (overlay != null) { dismissOverlay(); return; }
+        if (picking) { stopPicking(); return; }
+        if (findBar.getVisibility() == View.VISIBLE) { closeFind(); return; }
+        if (current != null && current.reading && current.view != null) { current.reading = false; current.view.reload(); refreshChrome(); return; }
+        WebView wv = live();
+        if (wv != null && wv.canGoBack()) { wv.goBack(); return; }
+        if (current != null && current.opener != null && tabs.contains(current.opener)) { close(current); return; }
+        moveTaskToBack(true);
+    }
+
+    // two fingers swiped sideways: back and forward
+    float f0x, f0y, f1x, f1y;
+    boolean twoOn, twoDone;
+
+    @Override public boolean dispatchTouchEvent(MotionEvent e) {
+        int a = e.getActionMasked();
+        if (a == MotionEvent.ACTION_POINTER_DOWN && e.getPointerCount() == 2) {
+            f0x = e.getX(0); f0y = e.getY(0); f1x = e.getX(1); f1y = e.getY(1);
+            twoOn = true; twoDone = false;
+        } else if (a == MotionEvent.ACTION_MOVE && twoOn && !twoDone && e.getPointerCount() == 2 && overlay == null && fullscreen == null) {
+            float dx0 = e.getX(0) - f0x, dx1 = e.getX(1) - f1x;
+            float dy0 = Math.abs(e.getY(0) - f0y), dy1 = Math.abs(e.getY(1) - f1y);
+            if (Math.signum(dx0) == Math.signum(dx1) && Math.min(Math.abs(dx0), Math.abs(dx1)) > Ui.dp(110)
+                && Math.max(dy0, dy1) < Ui.dp(70)) {
+                twoDone = true;
+                if (dx0 > 0) goBack(); else goForward();
+            }
+        } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL || (a == MotionEvent.ACTION_POINTER_DOWN && e.getPointerCount() > 2)) {
+            twoOn = false;
+        }
+        return super.dispatchTouchEvent(e);
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        if (e.getAction() == KeyEvent.ACTION_DOWN && e.isCtrlPressed()) {
+            int k = e.getKeyCode();
+            boolean shift = e.isShiftPressed();
+            switch (k) {
+                case KeyEvent.KEYCODE_L: openField(); return true;
+                case KeyEvent.KEYCODE_K: switcher(false); return true;
+                case KeyEvent.KEYCODE_T: if (shift) reopen(); else newTab(null, true); return true;
+                case KeyEvent.KEYCODE_N: if (shift) newPrivateTab(); else newTab(null, true); return true;
+                case KeyEvent.KEYCODE_W: if (current != null) close(current); return true;
+                case KeyEvent.KEYCODE_R: if (live() != null) live().reload(); return true;
+                case KeyEvent.KEYCODE_F: openFind(); return true;
+                case KeyEvent.KEYCODE_S: fold(!folded); return true;
+                case KeyEvent.KEYCODE_D: if (current != null && current.url != null) toast(store.toggleBookmark(current.url, current.title) ? "Bookmarked" : "Bookmark removed"); return true;
+                case KeyEvent.KEYCODE_Y: listPanel("History", store.history, null); return true;
+                case KeyEvent.KEYCODE_EQUALS: case KeyEvent.KEYCODE_PLUS: stepZoom(1); return true;
+                case KeyEvent.KEYCODE_MINUS: stepZoom(-1); return true;
+                case KeyEvent.KEYCODE_0: if (current != null) setZoom(current, 100); return true;
+                case KeyEvent.KEYCODE_LEFT_BRACKET: goBack(); return true;
+                case KeyEvent.KEYCODE_RIGHT_BRACKET: goForward(); return true;
+                case KeyEvent.KEYCODE_TAB: {
+                    if (tabs.size() < 2 || current == null) return true;
+                    int i = tabs.indexOf(current) + (shift ? -1 : 1);
+                    select(tabs.get((i + tabs.size()) % tabs.size()));
+                    return true;
+                }
+            }
+            if (k >= KeyEvent.KEYCODE_1 && k <= KeyEvent.KEYCODE_9) {
+                int i = k == KeyEvent.KEYCODE_9 ? tabs.size() - 1 : k - KeyEvent.KEYCODE_1;
+                if (i < tabs.size()) select(tabs.get(i));
+                return true;
+            }
+        }
+        return super.dispatchKeyEvent(e);
+    }
+
+    // ── intents and the session ─────────────────────────────────
+
+    boolean handle(Intent i) {
+        if (i == null) return false;
+        String act = i.getAction();
+        String url = null;
+        if (Intent.ACTION_VIEW.equals(act) && i.getData() != null) url = i.getDataString();
+        else if (Intent.ACTION_WEB_SEARCH.equals(act)) {
+            String q = i.getStringExtra(SearchManager.QUERY);
+            if (q != null) url = looksLikeUrl(q) ? fix(q) : store.searchUrl(q);
+        } else if (Intent.ACTION_SEND.equals(act)) {
+            String q = i.getStringExtra(Intent.EXTRA_TEXT);
+            if (q != null) {
+                java.util.regex.Matcher m = android.util.Patterns.WEB_URL.matcher(q);
+                url = m.find() && q.trim().contains("://") ? fix(m.group()) : looksLikeUrl(q) ? fix(q) : store.searchUrl(q);
+            }
+        }
+        if (url == null) return false;
+        if (current != null && current.url == null) load(url);
+        else {
+            Tab t = newTab(null, false);
+            t.url = url; t.host = Tab.hostOf(url);
+            select(t);
+        }
+        setIntent(new Intent());
+        return true;
+    }
+
+    void restore() {
+        if (!store.flag("restore", true)) return;
+        JSONObject s = store.session();
+        if (s == null) return;
+        JSONArray a = s.optJSONArray("tabs");
+        if (a == null || a.length() == 0) return;
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o == null || o.optString("u", "").isEmpty()) continue;
+            Tab t = new Tab(o.optString("u"), o.optString("t"), o.optBoolean("p"));
+            t.desktop = o.optBoolean("d");
+            tabs.add(t);
+        }
+        if (tabs.isEmpty()) return;
+        int sel = Math.max(0, Math.min(s.optInt("selected", 0), tabs.size() - 1));
+        select(tabs.get(sel));
+        ratio = (float) Math.max(0.2, Math.min(0.8, s.optDouble("ratio", 0.5)));
+        int sp = s.optInt("split", -1);
+        if (sp >= 0 && sp < tabs.size() && sp != sel) split(tabs.get(sp));
+    }
+
+    final Runnable saver = new Runnable() { public void run() { saveSession(); } };
+
+    void saveSoon() {
+        ui.removeCallbacks(saver);
+        ui.postDelayed(saver, 1500);
+    }
+
+    void saveSession() {
+        try {
+            JSONArray a = new JSONArray();
+            int sel = 0, n = 0, sp = -1;
+            Tab other = right == null ? null : current == left ? right : left;
+            for (Tab t : tabs) {
+                if (t.priv || t.url == null || !(t.url.startsWith("http://") || t.url.startsWith("https://"))) continue;
+                JSONObject o = new JSONObject();
+                o.put("u", t.url); o.put("t", t.title); o.put("p", t.pinned);
+                if (t.desktop) o.put("d", true);
+                a.put(o);
+                if (t == current) sel = n;
+                if (t == other) sp = n;
+                n++;
+            }
+            JSONObject s = new JSONObject();
+            s.put("tabs", a);
+            s.put("selected", sel);
+            s.put("split", sp);
+            s.put("ratio", ratio);
+            store.saveSessionRaw(s);
+        } catch (Exception ignored) {}
+    }
+
+    final Runnable tabsRefresher = new Runnable() { public void run() { refreshTabs(); } };
+
+    void refreshTabsSoon() {
+        ui.removeCallbacks(tabsRefresher);
+        ui.postDelayed(tabsRefresher, 120);
+    }
+
+    // ── small things ────────────────────────────────────────────
+
+    EditText input(String hint, float sp) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setHintTextColor(Ui.faint());
+        e.setTextColor(Ui.ink());
+        e.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        e.setSingleLine(true);
+        e.setBackground(null);
+        e.setGravity(Gravity.CENTER_VERTICAL);
+        e.setPadding(0, 0, 0, 0);
+        e.setHighlightColor(Ui.dark ? 0x553D7BFF : 0x333D7BFF);
+        return e;
+    }
+
+    void keyboard(final View v, boolean show) {
+        final InputMethodManager im = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (show) v.postDelayed(new Runnable() { public void run() { im.showSoftInput(v, InputMethodManager.SHOW_IMPLICIT); } }, 60);
+        else im.hideSoftInputFromWindow(v.getWindowToken(), 0);
+    }
+
+    void copy(String s) {
+        if (s == null) return;
+        ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Address", s));
+        toast("Copied");
+    }
+
+    void share(String url, String title) {
+        if (url == null) return;
+        Intent i = new Intent(Intent.ACTION_SEND);
+        i.setType("text/plain");
+        i.putExtra(Intent.EXTRA_TEXT, url);
+        if (title != null) i.putExtra(Intent.EXTRA_SUBJECT, title);
+        try { startActivity(Intent.createChooser(i, null)); } catch (Exception ignored) {}
+    }
+
+    void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+
+    abstract static class Watch implements TextWatcher {
+        public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+        public void onTextChanged(CharSequence s, int a, int b, int c) {}
+    }
+}
