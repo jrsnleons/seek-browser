@@ -22,7 +22,7 @@ Private tabs keep no history, but they share cookies with normal tabs, because A
 
 ## Install
 
-Download the APK from [Releases](../../releases), open it on the tablet, and allow installs from unknown sources. On Huawei tablets, turn off Pure Mode first. HarmonyOS NEXT (5.x) can't install APKs.
+Download [apk/Seek-1.1.apk](apk/Seek-1.1.apk) on the tablet (press "Download raw file"), open it on the tablet, and allow installs from unknown sources. On Huawei tablets, turn off Pure Mode first. HarmonyOS NEXT (5.x) can't install APKs.
 
 ## Build
 
